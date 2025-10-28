@@ -30,7 +30,7 @@ class ADNIDataset(Dataset):
         
         # Load NC samples - these are normal brains as like a scientific experiment control group.
         # This is gonna get label 0 btw.
-        for folder_name in ['NC', 'CN']: # Same conbcept above but just differnet .jpg/.jpeg file brain type.
+        for folder_name in ['NC', 'CN']: # Same concept above but just different .jpg/.jpeg file brain type.
             normal_dir = split_dir / folder_name
             if normal_dir.exists():
                 normal_files = list(normal_dir.glob('*.jpg')) + list(normal_dir.glob('*.jpeg'))
@@ -103,7 +103,7 @@ def create_dataloaders(data_root, batch_size = 16, img_size = 224, num_workers =
         random_state = 42
     )
     
-    # Train dataset with transforms and augemntations.
+    # Train dataset with transforms and augmentations.
     train_dataset = ADNIDataset.__new__(ADNIDataset)
     train_dataset.__dict__.update({
         'data_root': Path(data_root),
