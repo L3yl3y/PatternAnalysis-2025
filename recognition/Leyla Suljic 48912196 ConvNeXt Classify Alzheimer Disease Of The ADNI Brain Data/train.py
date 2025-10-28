@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.amp import autocast, GradScaler
+from torch.utils.data import WeightedRandomSampler
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -16,62 +17,80 @@ from modules import create_alzheimer_model
 # Preface: this code isn't all too exciting a lot of it does involve a lot of printing because I like being able to
 # see my metrics in a human readable format :3
 # ------------------------------------------------------------------------------------------------------------------
+class FocalLoss(nn.Module):
+    def __init__(self, alpha = 0.75, gamma = 2.0):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+    
+    def forward(self, inputs, targets):
+        ce_loss = nn.functional.cross_entropy(inputs, targets, reduction = 'none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
+        return focal_loss.mean()
+
+# ------------------------------------------------------------------------------------------------------------------
 class Config:
     DATA_ROOT = './data/ADNI/AD_NC'
     BATCH_SIZE = 16
     IMG_SIZE = 224
-    NUM_WORKERS = 8 # Changed to 8 since I have good pc.
+    NUM_WORKERS = 8
     MODEL_SIZE = 'base'
-    DROPOUT = 0.3
+    DROPOUT = 0.4
 
-    # Phase One --> Frozen.
-    PHASE1_EPOCHS = 10
+    PHASE1_EPOCHS = 15
     PHASE1_LR = 1e-3
-
-    # Phase Two --> Unfrozen --> Fine-Tuning.
-    PHASE2_EPOCHS = 30
-    PHASE2_LR = 1e-5
+    
+    PHASE2_EPOCHS = 50
+    PHASE2_LR = 5e-6
     WEIGHT_DECAY = 1e-4
-    PATIENCE = 10
+    PATIENCE = 15
     MIN_DELTA = 0.001
     USE_MIXED_PRECISION = True
     GRADIENT_CLIP = 1.0
-    LABEL_SMOOTHING = 0.1
-    CLASS_WEIGHTS = [1.0, 1.0]
+    LABEL_SMOOTHING = 0.05
+    CLASS_WEIGHTS = [0.4, 2.5]
+    
+    USE_FOCAL_LOSS = True
+    FOCAL_ALPHA = 0.75
+    FOCAL_GAMMA = 2.0
+    USE_BALANCED_SAMPLING = True
+    OPTIMIZE_THRESHOLD = True
+    TARGET_RECALL = 0.85
 
-    # Path Related Slop:
     OUTPUT_DIR = Path('./alzheimer_results')
     CHECKPOINT_DIR = OUTPUT_DIR / 'checkpoints'
     PLOTS_DIR = OUTPUT_DIR / 'plots'
 
-    # Create Directories:
     OUTPUT_DIR.mkdir(exist_ok = True, parents = True)
     CHECKPOINT_DIR.mkdir(exist_ok = True)
     PLOTS_DIR.mkdir(exist_ok = True)
 
 # ------------------------------------------------------------------------------------------------------------------
-class MetricsTracker: # Metrics for printing and showing pretty things :3
+class MetricsTracker:
     def __init__(self):
         self.train_losses = []
         self.val_losses = []
         self.train_accs = []
         self.val_accs = []
+        self.val_recalls = []
         self.learning_rates = []
         self.best_val_acc = 0.0
         self.best_epoch = 0
 
-    def update(self, train_loss, val_loss, train_acc, val_acc, lr):
+    def update(self, train_loss, val_loss, train_acc, val_acc, val_recall, lr):
         self.train_losses.append(train_loss)
         self.val_losses.append(val_loss)
         self.train_accs.append(train_acc)
         self.val_accs.append(val_acc)
+        self.val_recalls.append(val_recall)
         self.learning_rates.append(lr)
 
         if val_acc > self.best_val_acc:
             self.best_val_acc = val_acc
             self.best_epoch = len(self.val_accs) - 1
 
-    def plot(self, save_path): # Because I want to see everything teehee :3
+    def plot(self, save_path):
         fig, axes = plt.subplots(2, 2, figsize = (15, 10))
         epochs = range(1, len(self.train_losses) + 1)
 
@@ -92,6 +111,7 @@ class MetricsTracker: # Metrics for printing and showing pretty things :3
         axes[0, 1].plot(epochs, self.val_accs, 'r-', label = 'Val Acc', linewidth = 2)
         axes[0, 1].axvline(self.best_epoch + 1, color = 'g', linestyle = '--', alpha = 0.5, label = f'Best Epoch ({self.best_epoch + 1})')
         axes[0, 1].axhline(0.8, color = 'orange', linestyle = '--', alpha = 0.5, label = 'Target (0.8)')
+        axes[0, 1].axhline(0.85, color = 'purple', linestyle = '--', alpha = 0.5, label = 'Goal (0.85)')
         axes[0, 1].set_xlabel('Epoch', fontsize = 12)
         axes[0, 1].set_ylabel('Accuracy', fontsize = 12)
         axes[0, 1].set_title('Training & Validation Accuracy', fontsize = 14, fontweight = 'bold')
@@ -99,29 +119,41 @@ class MetricsTracker: # Metrics for printing and showing pretty things :3
         axes[0, 1].grid(True, alpha = 0.3)
 
         # ------------------------------------------------------------------------------------------------------------------
-        # PLOT 3: Learning rate.
-        axes[1, 0].plot(epochs, self.learning_rates, 'g-', linewidth = 2)
+        # PLOT 3: Recall (AD Detection).
+        axes[1, 0].plot(epochs, self.val_recalls, 'purple', linewidth = 2, label = 'Val Recall')
+        axes[1, 0].axhline(0.85, color = 'orange', linestyle = '--', alpha = 0.5, label = 'Target (0.85)')
         axes[1, 0].set_xlabel('Epoch', fontsize = 12)
-        axes[1, 0].set_ylabel('Learning Rate', fontsize = 12)
-        axes[1, 0].set_title('Learning Rate Schedule', fontsize = 14, fontweight = 'bold')
-        axes[1, 0].set_yscale('log')
+        axes[1, 0].set_ylabel('Recall (AD Detection)', fontsize = 12)
+        axes[1, 0].set_title('AD Detection Rate', fontsize = 14, fontweight = 'bold')
+        axes[1, 0].legend()
         axes[1, 0].grid(True, alpha = 0.3)
 
-        # All this text is going to be printed, it is kinda gross - but I went with it.
+        # ------------------------------------------------------------------------------------------------------------------
+        # PLOT 4: Summary text.
         summary_text = f"""
             Best Validation Accuracy: {self.best_val_acc:.4f}
             Best Epoch: {self.best_epoch + 1}
             Final Train Acc: {self.train_accs[-1]:.4f}
             Final Val Acc: {self.val_accs[-1]:.4f}
+            Final Val Recall: {self.val_recalls[-1]:.4f}
             Final Train Loss: {self.train_losses[-1]:.4f}
             Final Val Loss: {self.val_losses[-1]:.4f}
             Total Epochs: {len(self.train_losses)}
-            Target Achieved: {'✓ YES' if self.val_accs >= 0.8 else '✗ NO'}
+            Target Achieved: {'✓ YES' if self.best_val_acc >= 0.8 else '✗ NO'}
         """
+        axes[1, 1].axis('off')
         axes[1, 1].text(0.1, 0.5, summary_text, fontsize = 11, verticalalignment = 'center', fontfamily = 'monospace', bbox = dict(boxstyle = 'round', facecolor = 'wheat', alpha = 0.3))
         plt.tight_layout()
-        plt.savefig(save_path, dpi = 300, bbox_inches = 'tight') # Saving results so I can add to the README + so I can see in general.
+        plt.savefig(save_path, dpi = 300, bbox_inches = 'tight')
         plt.close()
+
+# ------------------------------------------------------------------------------------------------------------------
+def create_balanced_sampler(dataset):
+    labels = [label for _, label in dataset]
+    class_counts = np.bincount(labels)
+    class_weights = 1.0 / class_counts
+    sample_weights = [class_weights[label] for label in labels]
+    return WeightedRandomSampler(weights = sample_weights, num_samples = len(sample_weights), replacement = True)
 
 # ------------------------------------------------------------------------------------------------------------------
 def train_one_epoch(model, dataloader, criterion, optimizer, device, scaler = None, epoch = 1, phase = 'Phase1'):
@@ -165,7 +197,7 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, scaler = No
     return epoch_loss, epoch_acc
 
 # ------------------------------------------------------------------------------------------------------------------
-def evaluate(model, dataloader, criterion, device, split = 'Val'):
+def evaluate(model, dataloader, criterion, device, split = 'Val', threshold = 0.5):
     model.eval()
     running_loss = 0.0
     all_preds = []
@@ -179,13 +211,13 @@ def evaluate(model, dataloader, criterion, device, split = 'Val'):
             outputs = model(images)
             loss = criterion(outputs, labels)
             running_loss += loss.item() * images.size(0)
-            probs = torch.softmax(outputs, dim = 1)[:, 1]  # Probability of AD class
-            preds = torch.argmax(outputs, dim = 1)
+            probs = torch.softmax(outputs, dim = 1)[:, 1]
+            preds = (probs >= threshold).long()
             all_probs.extend(probs.cpu().numpy())
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
-    epoch_loss = running_loss / len(dataloader.dataset)
 
+    epoch_loss = running_loss / len(dataloader.dataset)
     metrics = {
         'loss': epoch_loss,
         'accuracy': accuracy_score(all_labels, all_preds),
@@ -197,27 +229,88 @@ def evaluate(model, dataloader, criterion, device, split = 'Val'):
         'labels': all_labels,
         'probabilities': all_probs
     }
-
     return metrics
 
 # ------------------------------------------------------------------------------------------------------------------
-def train_model(): # With many plotting functions.
+def find_optimal_threshold(model, dataloader, device, target_recall = 0.85):
+    model.eval()
+    all_probs = []
+    all_labels = []
+
+    with torch.no_grad():
+        for images, labels in tqdm(dataloader, desc = '[THRESHOLD OPT]'):
+            images = images.to(device)
+            outputs = model(images)
+            probs = torch.softmax(outputs, dim = 1)[:, 1]
+            all_probs.extend(probs.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+
+    all_probs = np.array(all_probs)
+    all_labels = np.array(all_labels)
+    best_threshold = 0.5
+    best_acc = 0.0
+
+    for threshold in np.arange(0.3, 0.7, 0.01):
+        preds = (all_probs >= threshold).astype(int)
+        recall = recall_score(all_labels, preds, zero_division = 0)
+        if recall >= target_recall:
+            acc = accuracy_score(all_labels, preds)
+            if acc > best_acc:
+                best_acc = acc
+                best_threshold = threshold
+
+    print(f"\nOptimal threshold: {best_threshold:.3f}")
+    print(f"  Achieves recall: {recall_score(all_labels, (all_probs >= best_threshold).astype(int)):.3f}")
+    print(f"  With accuracy: {best_acc:.3f}")
+    return best_threshold
+
+# ------------------------------------------------------------------------------------------------------------------
+def train_model():
+    print("=" * 80)
+    print("OPTIMIZED ALZHEIMER'S CLASSIFICATION")
+    print("=" * 80)
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Device: {device}")
+    if device.type == 'cuda':
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+
+    print(f"\nLoading data from {Config.DATA_ROOT}")
     train_loader, val_loader, test_loader = create_dataloaders(
         data_root = Config.DATA_ROOT,
-        batch_size= Config.BATCH_SIZE,
+        batch_size = Config.BATCH_SIZE,
         img_size = Config.IMG_SIZE,
         num_workers = Config.NUM_WORKERS
     )
 
-    model = create_alzheimer_model()
-    model = model.to(device)
-    class_weights = torch.tensor(Config.CLASS_WEIGHTS, dtype = torch.float32).to(device)
-    criterion = nn.CrossEntropyLoss(weight = class_weights, label_smoothing = Config.LABEL_SMOOTHING)
-    tracker = MetricsTracker()
+    if Config.USE_BALANCED_SAMPLING:
+        print("✓ Using class-balanced sampling")
+        train_sampler = create_balanced_sampler(train_loader.dataset)
+        train_loader = torch.utils.data.DataLoader(
+            train_loader.dataset,
+            batch_size = Config.BATCH_SIZE,
+            sampler = train_sampler,
+            num_workers = Config.NUM_WORKERS
+        )
+
+    print(f"Train: {len(train_loader.dataset)} | Val: {len(val_loader.dataset)} | Test: {len(test_loader.dataset)}")
+
+    print("\nBuilding model...")
+    model = create_alzheimer_model(model_size = Config.MODEL_SIZE, dropout = Config.DROPOUT, device = device)
+    print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+    if Config.USE_FOCAL_LOSS:
+        print(f"✓ Using Focal Loss (alpha = {Config.FOCAL_ALPHA}, gamma = {Config.FOCAL_GAMMA})")
+        criterion = FocalLoss(alpha = Config.FOCAL_ALPHA, gamma = Config.FOCAL_GAMMA)
+    else:
+        class_weights = torch.FloatTensor(Config.CLASS_WEIGHTS).to(device)
+        criterion = nn.CrossEntropyLoss(weight = class_weights, label_smoothing = Config.LABEL_SMOOTHING)
+
     scaler = GradScaler() if Config.USE_MIXED_PRECISION and device.type == 'cuda' else None
+    tracker = MetricsTracker()
 
     # ------------------------------------------------------------------------------------------------------------------
-    # PHASE 1: FROZEN BACKBONE PHASE 1 BTW!
+    # PHASE 1: FROZEN STUFF PHASE 1 BTW:
     # ------------------------------------------------------------------------------------------------------------------
     print("\n" + "=" * 80)
     print("PHASE 1: CLASSIFIER HEAD TRAINING (FROZEN BACKBONE)")
@@ -226,51 +319,38 @@ def train_model(): # With many plotting functions.
     print("=" * 80)
 
     model.freeze_backbone(freeze = True)
-    optimizer = optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr = Config.PHASE1_LR,
-        weight_decay = Config.WEIGHT_DECAY
-    )
-
+    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr = Config.PHASE1_LR, weight_decay = Config.WEIGHT_DECAY)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max = Config.PHASE1_EPOCHS, eta_min = 1e-6)
     best_val_acc = 0.0
     patience_counter = 0
     start_time = time.time()
 
     for epoch in range(1, Config.PHASE1_EPOCHS + 1):
-        train_loss, train_acc = train_one_epoch(
-            model, train_loader, criterion, optimizer, device, scaler, epoch, 'Phase1'
-        )
-
+        train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device, scaler, epoch, 'Phase1')
         val_metrics = evaluate(model, val_loader, criterion, device, 'Val')
         val_loss, val_acc = val_metrics['loss'], val_metrics['accuracy']
         scheduler.step()
         current_lr = optimizer.param_groups[0]['lr']
-        tracker.update(train_loss, val_loss, train_acc, val_acc, current_lr)
+        tracker.update(train_loss, val_loss, train_acc, val_acc, val_metrics['recall'], current_lr)
 
-        # Print epoch results
         print(f"\nEpoch {epoch}/{Config.PHASE1_EPOCHS}:")
         print(f"  Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f}")
         print(f"  Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
         print(f"  Precision: {val_metrics['precision']:.4f} | Recall: {val_metrics['recall']:.4f} | F1: {val_metrics['f1']:.4f}")
         print(f"  LR: {current_lr:.2e}")
 
-        # Save best model:
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_acc': val_acc,
-                'config': {k: str(v) for k, v in vars(Config).items() if not k.startswith('_')}
+                'val_acc': val_acc
             }, Config.CHECKPOINT_DIR / 'best_model_phase1.pth')
             print(f"  ✓ New best model saved! (Val Acc: {val_acc:.4f})")
             patience_counter = 0
         else:
             patience_counter += 1
 
-        # Early stopping
         if patience_counter >= Config.PATIENCE:
             print(f"\n⚠ Early stopping triggered after {epoch} epochs")
             break
@@ -289,7 +369,7 @@ def train_model(): # With many plotting functions.
     print(f"Epochs: {Config.PHASE2_EPOCHS} | LR: {Config.PHASE2_LR}")
     print("=" * 80)
 
-    checkpoint = torch.load(Config.CHECKPOINT_DIR / 'best_model_phase1.pth') # Load best phase 1 model.
+    checkpoint = torch.load(Config.CHECKPOINT_DIR / 'best_model_phase1.pth')
     model.load_state_dict(checkpoint['model_state_dict'])
     print(f"✓ Loaded best Phase 1 model (Val Acc: {checkpoint['val_acc']:.4f})")
 
@@ -306,7 +386,7 @@ def train_model(): # With many plotting functions.
         val_loss, val_acc = val_metrics['loss'], val_metrics['accuracy']
         scheduler.step()
         current_lr = optimizer.param_groups[0]['lr']
-        tracker.update(train_loss, val_loss, train_acc, val_acc, current_lr)
+        tracker.update(train_loss, val_loss, train_acc, val_acc, val_metrics['recall'], current_lr)
 
         print(f"\nEpoch {epoch}/{Config.PHASE2_EPOCHS}:")
         print(f"  Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f}")
@@ -314,15 +394,12 @@ def train_model(): # With many plotting functions.
         print(f"  Precision: {val_metrics['precision']:.4f} | Recall: {val_metrics['recall']:.4f} | F1: {val_metrics['f1']:.4f}")
         print(f"  LR: {current_lr:.2e}")
 
-        # Save best model.
         if val_acc > best_val_acc + Config.MIN_DELTA:
             best_val_acc = val_acc
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_acc': val_acc,
-                'config': {k: str(v) for k, v in vars(Config).items() if not k.startswith('_')}
+                'val_acc': val_acc
             }, Config.CHECKPOINT_DIR / 'best_model_final.pth')
             print(f"  ✓ New best model saved! (Val Acc: {val_acc:.4f})")
             patience_counter = 0
@@ -338,13 +415,22 @@ def train_model(): # With many plotting functions.
     print(f"  Best Val Acc: {best_val_acc:.4f}")
 
     # ------------------------------------------------------------------------------------------------------------------
+    checkpoint = torch.load(Config.CHECKPOINT_DIR / 'best_model_final.pth')
+    model.load_state_dict(checkpoint['model_state_dict'])
+
+    optimal_threshold = 0.5
+    if Config.OPTIMIZE_THRESHOLD:
+        print("\n" + "=" * 80)
+        print("OPTIMIZING DECISION THRESHOLD")
+        print("=" * 80)
+        optimal_threshold = find_optimal_threshold(model, val_loader, device, Config.TARGET_RECALL)
+
+    # ------------------------------------------------------------------------------------------------------------------
     print("\n" + "=" * 80)
     print("FINAL EVALUATION ON TEST SET")
     print("=" * 80)
-    checkpoint = torch.load(Config.CHECKPOINT_DIR / 'best_model_final.pth')
-    model.load_state_dict(checkpoint['model_state_dict'])
-    print(f"✓ Loaded best model from epoch {checkpoint['epoch']}")
-    test_metrics = evaluate(model, test_loader, criterion, device, 'Test')
+    print(f"✓ Using threshold: {optimal_threshold:.3f}")
+    test_metrics = evaluate(model, test_loader, criterion, device, 'Test', threshold = optimal_threshold)
 
     print(f"\n🎯 TEST SET RESULTS:")
     print("=" * 80)
@@ -355,15 +441,15 @@ def train_model(): # With many plotting functions.
     print(f"  AUC:       {test_metrics['auc']:.4f}")
     print("=" * 80)
 
-    final_results = { # Saving the metrics here.
+    final_results = {
         'test_accuracy': float(test_metrics['accuracy']),
         'test_precision': float(test_metrics['precision']),
         'test_recall': float(test_metrics['recall']),
         'test_f1': float(test_metrics['f1']),
         'test_auc': float(test_metrics['auc']),
         'best_val_acc': float(best_val_acc),
-        'total_training_time_minutes': float((phase1_time + phase2_time) / 60),
-        'config': {k: str(v) for k, v in vars(Config).items() if not k.startswith('_')}
+        'optimal_threshold': float(optimal_threshold),
+        'total_training_time_minutes': float((phase1_time + phase2_time) / 60)
     }
 
     with open(Config.OUTPUT_DIR / 'final_results.json', 'w') as f:
@@ -371,7 +457,6 @@ def train_model(): # With many plotting functions.
 
     tracker.plot(Config.PLOTS_DIR / 'training_curves.png')
 
-    # Plotting here pal:
     plot_confusion_matrix(
         test_metrics['labels'],
         test_metrics['predictions'],
@@ -387,7 +472,7 @@ def train_model(): # With many plotting functions.
     print(f"\n✓ All results saved to {Config.OUTPUT_DIR}")
     print("\n" + "=" * 80)
     print("TRAINING COMPLETE! 🎉")
-    print("=" * 80) #  With many plotting functios
+    print("=" * 80)
 
 # ------------------------------------------------------------------------------------------------------------------
 def plot_confusion_matrix(y_true, y_pred, save_path):
@@ -407,8 +492,8 @@ def plot_roc_curve(y_true, y_probs, save_path):
     auc = roc_auc_score(y_true, y_probs)
     plt.figure(figsize = (8, 6))
     plt.plot(fpr, tpr, 'b-', linewidth = 2, label = f'ROC Curve (AUC = {auc:.4f})')
-    plt.plot([0, 1], [0, 1], 'r--', linewidth=2, label = 'Random Classifier')
-    plt.xlabel('False Positive Rate', fontsize=12)
+    plt.plot([0, 1], [0, 1], 'r--', linewidth = 2, label = 'Random Classifier')
+    plt.xlabel('False Positive Rate', fontsize = 12)
     plt.ylabel('True Positive Rate', fontsize = 12)
     plt.title('ROC Curve - Test Set', fontsize = 14, fontweight = 'bold')
     plt.legend()
