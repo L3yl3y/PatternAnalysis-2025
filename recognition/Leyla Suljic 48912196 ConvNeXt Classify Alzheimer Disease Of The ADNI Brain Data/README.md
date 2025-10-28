@@ -14,3 +14,4 @@ Plus based on my results from analysis it seemed to be an issue where I was over
 
 My idea here is to increase the weighting for more significant focus on the AD (heavier penalty if i mistake the AD) and to have an increased no. of epochs as well as to increase my dropout (I am trying to fix my val accuracy vs test accuracy discrepancy).
 ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+RUN 2:

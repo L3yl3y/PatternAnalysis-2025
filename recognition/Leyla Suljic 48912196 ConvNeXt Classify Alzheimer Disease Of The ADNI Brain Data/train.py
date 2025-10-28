@@ -17,6 +17,9 @@ from modules import create_alzheimer_model
 # Preface: this code isn't all too exciting a lot of it does involve a lot of printing because I like being able to
 # see my metrics in a human readable format :3
 # ------------------------------------------------------------------------------------------------------------------
+
+print("IT IS PREPARING TO RUN RUN RUN! DO NOT FRET IT WILL BEGIN SOON YAY!...")
+print("Loading required modules and preparing environment...")
 class FocalLoss(nn.Module):
     def __init__(self, alpha = 0.75, gamma = 2.0):
         super(FocalLoss, self).__init__()
