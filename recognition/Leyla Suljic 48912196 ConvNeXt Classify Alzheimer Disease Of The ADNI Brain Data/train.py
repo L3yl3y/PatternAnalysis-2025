@@ -1,16 +1,3 @@
-# ------------------------------------------------------------------------------------------------------------------
-#  ConvNeXt Training Script for Alzheimer's Classification
-# ------------------------------------------------------------------------------------------------------------------
-#  This script trains ConvNeXt to classify brain MRIs as Normal or Alzheimer's Disease.
-#  Target: >0.8 accuracy on test set (Hard difficulty requirement)
-#
-#  Training Strategy:
-#  1. Start with frozen backbone (pretrained weights) - train only classifier
-#  2. Unfreeze and fine-tune entire model with lower learning rate
-#  3. Use mixed precision training for SPEED
-#  4. Early stopping to prevent overfitting
-#  5. Learning rate scheduling for optimal convergence
-# ------------------------------------------------------------------------------------------------------------------
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -22,73 +9,47 @@ from pathlib import Path
 from tqdm import tqdm
 import time
 import json
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, roc_auc_score, \
-    roc_curve
-import warnings
-
-warnings.filterwarnings('ignore')
-
-# Import our modules
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, roc_auc_score, roc_curve
 from dataset import create_dataloaders
 from modules import create_alzheimer_model
-
-
-# ------------------------------------------------------------------------------------------------------------------
-# CONFIGURATION
-# ------------------------------------------------------------------------------------------------------------------
+    # ------------------------------------------------------------------------------------------------------------------
+    # Preface: this code isn't all too exciting a lot of it does involve 
+    # ------------------------------------------------------------------------------------------------------------------
 class Config:
-    """Training configuration - tune these for best results!"""
+    DATA_ROOT = './data/ADNI/AD_NC'
+    BATCH_SIZE = 16
+    IMG_SIZE = 224
+    NUM_WORKERS = 8 # Changed to 8 since I have good pc.
+    MODEL_SIZE = 'base'
+    DROPOUT = 0.3
 
-    # Data settings
-    DATA_ROOT = './data/ADNI/AD_NC'  # CHANGE THIS to your ADNI path!
-    BATCH_SIZE = 16  # Higher = faster but needs more memory
-    IMG_SIZE = 224  # ConvNeXt default
-    NUM_WORKERS = 4  # Parallel data loading
+    # Phase One --> Frozen.
+    PHASE1_EPOCHS = 10
+    PHASE1_LR = 1e-3
 
-    # Model settings
-    MODEL_SIZE = 'tiny'  # 'tiny', 'small', or 'base'
-    DROPOUT = 0.3  # Regularization
+    # Phase Two --> Unfrozen --> Fine-Tuning.
+    PHASE2_EPOCHS = 30
+    PHASE2_LR = 1e-5
+    WEIGHT_DECAY = 1e-4
+    PATIENCE = 10
+    MIN_DELTA = 0.001
+    USE_MIXED_PRECISION = True
+    GRADIENT_CLIP = 1.0
+    LABEL_SMOOTHING = 0.1
+    CLASS_WEIGHTS = [1.0, 1.0]
 
-    # Training settings - Phase 1 (frozen backbone)
-    PHASE1_EPOCHS = 10  # Quick warmup of classifier head
-    PHASE1_LR = 1e-3  # Higher LR for new layers
-
-    # Training settings - Phase 2 (full fine-tuning)
-    PHASE2_EPOCHS = 30  # Deep fine-tuning
-    PHASE2_LR = 1e-5  # Lower LR to not destroy pretrained weights
-
-    # Optimization
-    WEIGHT_DECAY = 1e-4  # L2 regularization
-    PATIENCE = 10  # Early stopping patience
-    MIN_DELTA = 0.001  # Minimum improvement for early stopping
-
-    # Advanced settings
-    USE_MIXED_PRECISION = True  # AMP for 2x speed
-    GRADIENT_CLIP = 1.0  # Prevent exploding gradients
-    LABEL_SMOOTHING = 0.1  # Prevents overconfidence
-
-    # Class weights for imbalanced dataset
-    # If AD:Normal = 200:200, use [1.0, 1.0]
-    # If AD:Normal = 300:100, use [0.5, 1.5] to balance
-    CLASS_WEIGHTS = [1.0, 1.0]  # Adjust based on your data!
-
-    # Paths
+    # Path Related Slop:
     OUTPUT_DIR = Path('./alzheimer_results')
     CHECKPOINT_DIR = OUTPUT_DIR / 'checkpoints'
     PLOTS_DIR = OUTPUT_DIR / 'plots'
 
-    # Create directories
-    OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
-    CHECKPOINT_DIR.mkdir(exist_ok=True)
-    PLOTS_DIR.mkdir(exist_ok=True)
-
+    # Create Directories:
+    OUTPUT_DIR.mkdir(exist_ok = True, parents = True)
+    CHECKPOINT_DIR.mkdir(exist_ok = True)
+    PLOTS_DIR.mkdir(exist_ok = True)
 
 # ------------------------------------------------------------------------------------------------------------------
-# METRIC TRACKER
-# ------------------------------------------------------------------------------------------------------------------
-class MetricsTracker:
-    """Track and visualize training metrics"""
-
+class MetricsTracker: # Metrics for printing and showing pretty things :3
     def __init__(self):
         self.train_losses = []
         self.val_losses = []
@@ -109,71 +70,57 @@ class MetricsTracker:
             self.best_val_acc = val_acc
             self.best_epoch = len(self.val_accs) - 1
 
-    def plot(self, save_path):
-        """Create comprehensive training plots"""
-        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-
+    def plot(self, save_path): # Because I want to see everything teehee :3
+        fig, axes = plt.subplots(2, 2, figsize = (15, 10))
         epochs = range(1, len(self.train_losses) + 1)
 
-        # Loss plot
-        axes[0, 0].plot(epochs, self.train_losses, 'b-', label='Train Loss', linewidth=2)
-        axes[0, 0].plot(epochs, self.val_losses, 'r-', label='Val Loss', linewidth=2)
-        axes[0, 0].axvline(self.best_epoch + 1, color='g', linestyle='--', alpha=0.5,
-                           label=f'Best Epoch ({self.best_epoch + 1})')
-        axes[0, 0].set_xlabel('Epoch', fontsize=12)
-        axes[0, 0].set_ylabel('Loss', fontsize=12)
-        axes[0, 0].set_title('Training & Validation Loss', fontsize=14, fontweight='bold')
+        # ------------------------------------------------------------------------------------------------------------------
+        # PLOT 1: Loss plot.
+        axes[0, 0].plot(epochs, self.train_losses, 'b-', label = 'Train Loss', linewidth = 2)
+        axes[0, 0].plot(epochs, self.val_losses, 'r-', label = 'Val Loss', linewidth = 2)
+        axes[0, 0].axvline(self.best_epoch + 1, color = 'g', linestyle = '--', alpha = 0.5, label = f'Best Epoch ({self.best_epoch + 1})')
+        axes[0, 0].set_xlabel('Epoch', fontsize = 12)
+        axes[0, 0].set_ylabel('Loss', fontsize = 12)
+        axes[0, 0].set_title('Training & Validation Loss', fontsize = 14, fontweight = 'bold')
         axes[0, 0].legend()
-        axes[0, 0].grid(True, alpha=0.3)
+        axes[0, 0].grid(True, alpha = 0.3)
 
-        # Accuracy plot
-        axes[0, 1].plot(epochs, self.train_accs, 'b-', label='Train Acc', linewidth=2)
-        axes[0, 1].plot(epochs, self.val_accs, 'r-', label='Val Acc', linewidth=2)
-        axes[0, 1].axvline(self.best_epoch + 1, color='g', linestyle='--', alpha=0.5,
-                           label=f'Best Epoch ({self.best_epoch + 1})')
-        axes[0, 1].axhline(0.8, color='orange', linestyle='--', alpha=0.5, label='Target (0.8)')
-        axes[0, 1].set_xlabel('Epoch', fontsize=12)
-        axes[0, 1].set_ylabel('Accuracy', fontsize=12)
-        axes[0, 1].set_title('Training & Validation Accuracy', fontsize=14, fontweight='bold')
+        # ------------------------------------------------------------------------------------------------------------------
+        # PLOT 2: Accuracy plot.
+        axes[0, 1].plot(epochs, self.train_accs, 'b-', label = 'Train Acc', linewidth = 2)
+        axes[0, 1].plot(epochs, self.val_accs, 'r-', label = 'Val Acc', linewidth = 2)
+        axes[0, 1].axvline(self.best_epoch + 1, color = 'g', linestyle = '--', alpha = 0.5, label = f'Best Epoch ({self.best_epoch + 1})')
+        axes[0, 1].axhline(0.8, color = 'orange', linestyle = '--', alpha = 0.5, label = 'Target (0.8)')
+        axes[0, 1].set_xlabel('Epoch', fontsize = 12)
+        axes[0, 1].set_ylabel('Accuracy', fontsize = 12)
+        axes[0, 1].set_title('Training & Validation Accuracy', fontsize = 14, fontweight = 'bold')
         axes[0, 1].legend()
-        axes[0, 1].grid(True, alpha=0.3)
+        axes[0, 1].grid(True, alpha = 0.3)
 
-        # Learning rate
-        axes[1, 0].plot(epochs, self.learning_rates, 'g-', linewidth=2)
-        axes[1, 0].set_xlabel('Epoch', fontsize=12)
-        axes[1, 0].set_ylabel('Learning Rate', fontsize=12)
-        axes[1, 0].set_title('Learning Rate Schedule', fontsize=14, fontweight='bold')
+        # ------------------------------------------------------------------------------------------------------------------
+        # PLOT 3: Learning rate.
+        axes[1, 0].plot(epochs, self.learning_rates, 'g-', linewidth = 2)
+        axes[1, 0].set_xlabel('Epoch', fontsize = 12)
+        axes[1, 0].set_ylabel('Learning Rate', fontsize = 12)
+        axes[1, 0].set_title('Learning Rate Schedule', fontsize = 14, fontweight = 'bold')
         axes[1, 0].set_yscale('log')
-        axes[1, 0].grid(True, alpha=0.3)
+        axes[1, 0].grid(True, alpha = 0.3)
 
-        # Summary statistics
-        axes[1, 1].axis('off')
+        # All this text is going to be printed, it is kinda gross - but I went with it.
         summary_text = f"""
-        TRAINING SUMMARY
-        {'=' * 40}
-
-        Best Validation Accuracy: {self.best_val_acc:.4f}
-        Best Epoch: {self.best_epoch + 1}
-
-        Final Train Acc: {self.train_accs[-1]:.4f}
-        Final Val Acc: {self.val_accs[-1]:.4f}
-
-        Final Train Loss: {self.train_losses[-1]:.4f}
-        Final Val Loss: {self.val_losses[-1]:.4f}
-
-        Total Epochs: {len(self.train_losses)}
-
-        Target Achieved: {'✓ YES' if self.best_val_acc >= 0.8 else '✗ NO'}
+            Best Validation Accuracy: {self.best_val_acc:.4f}
+            Best Epoch: {self.best_epoch + 1}
+            Final Train Acc: {self.train_accs[-1]:.4f}
+            Final Val Acc: {self.val_accs[-1]:.4f}
+            Final Train Loss: {self.train_losses[-1]:.4f}
+            Final Val Loss: {self.val_losses[-1]:.4f}
+            Total Epochs: {len(self.train_losses)}
+            Target Achieved: {'✓ YES' if self.val_accs >= 0.8 else '✗ NO'}
         """
-        axes[1, 1].text(0.1, 0.5, summary_text, fontsize=11, verticalalignment='center',
-                        fontfamily='monospace', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
-
+        axes[1, 1].text(0.1, 0.5, summary_text, fontsize = 11, verticalalignment = 'center', fontfamily = 'monospace', bbox = dict(boxstyle = 'round', facecolor = 'wheat', alpha = 0.3))
         plt.tight_layout()
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.savefig(save_path, dpi = 300, bbox_inches = 'tight') # Saving results so I can add to the README + so I can see in general.
         plt.close()
-
-        print(f"✓ Training plots saved to {save_path}")
-
 
 # ------------------------------------------------------------------------------------------------------------------
 # TRAINING & EVALUATION FUNCTIONS
@@ -271,8 +218,6 @@ def evaluate(model, dataloader, criterion, device, split='Val'):
     return metrics
 
 
-# ------------------------------------------------------------------------------------------------------------------
-# MAIN TRAINING FUNCTION
 # ------------------------------------------------------------------------------------------------------------------
 def train_model():
     """Main training pipeline"""
