@@ -195,13 +195,16 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, scaler=None
 
         # Mixed precision training
         if scaler is not None:
-            with autocast(device_type=device.type, dtype=torch.float16):
+            with autocast(device_type='cuda'):
                 outputs = model(images)
                 loss = criterion(outputs, labels)
 
             scaler.scale(loss).backward()
+
+            # Gradient clipping
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), Config.GRADIENT_CLIP)
+
             scaler.step(optimizer)
             scaler.update()
         else:
@@ -226,8 +229,7 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, scaler=None
     return epoch_loss, epoch_acc
 
 
-@torch.no_grad()
-def evaluate(model, dataloader, criterion, device, phase='Val'):
+def evaluate(model, dataloader, criterion, device, split='Val'):
     """Evaluate model"""
     model.eval()
     running_loss = 0.0
@@ -235,46 +237,32 @@ def evaluate(model, dataloader, criterion, device, phase='Val'):
     all_labels = []
     all_probs = []
 
-    pbar = tqdm(dataloader, desc=f'[{phase.upper()}]')
+    with torch.no_grad():
+        for images, labels in tqdm(dataloader, desc=f'[{split}]'):
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
 
-    for images, labels in pbar:
-        images = images.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
+            outputs = model(images)
+            loss = criterion(outputs, labels)
 
-        outputs = model(images)
-        loss = criterion(outputs, labels)
+            running_loss += loss.item() * images.size(0)
+            probs = torch.softmax(outputs, dim=1)[:, 1]  # Probability of AD class
+            preds = torch.argmax(outputs, dim=1)
 
-        running_loss += loss.item() * images.size(0)
-
-        probs = torch.softmax(outputs, dim=1)
-        preds = torch.argmax(probs, dim=1)
-
-        all_preds.extend(preds.cpu().numpy())
-        all_labels.extend(labels.cpu().numpy())
-        all_probs.extend(probs[:, 1].cpu().numpy())  # Probability of AD class
-
-        pbar.set_postfix({'loss': loss.item()})
+            all_probs.extend(probs.cpu().numpy())
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
 
     epoch_loss = running_loss / len(dataloader.dataset)
-    epoch_acc = accuracy_score(all_labels, all_preds)
 
-    # Calculate detailed metrics
-    precision = precision_score(all_labels, all_preds, zero_division=0)
-    recall = recall_score(all_labels, all_preds, zero_division=0)
-    f1 = f1_score(all_labels, all_preds, zero_division=0)
-
-    try:
-        auc = roc_auc_score(all_labels, all_probs)
-    except:
-        auc = 0.0
-
+    # Calculate metrics
     metrics = {
         'loss': epoch_loss,
-        'accuracy': epoch_acc,
-        'precision': precision,
-        'recall': recall,
-        'f1': f1,
-        'auc': auc,
+        'accuracy': accuracy_score(all_labels, all_preds),
+        'precision': precision_score(all_labels, all_preds, zero_division=0),
+        'recall': recall_score(all_labels, all_preds, zero_division=0),
+        'f1': f1_score(all_labels, all_preds, zero_division=0),
+        'auc': roc_auc_score(all_labels, all_probs) if len(np.unique(all_labels)) > 1 else 0.0,
         'predictions': all_preds,
         'labels': all_labels,
         'probabilities': all_probs
@@ -288,22 +276,24 @@ def evaluate(model, dataloader, criterion, device, phase='Val'):
 # ------------------------------------------------------------------------------------------------------------------
 def train_model():
     """Main training pipeline"""
-
-    print("=" * 80)
-    print("CONVNEXT ALZHEIMER'S DISEASE CLASSIFIER - TRAINING")
-    print("=" * 80)
-    print(f"Target Accuracy: >0.8 (Hard difficulty)")
-    print("=" * 80)
-
-    # Setup device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"\nDevice: {device}")
-    if torch.cuda.is_available():
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
-        print(f"CUDA Version: {torch.version.cuda}")
-
-    # Create dataloaders
     print("\n" + "=" * 80)
+    print("ALZHEIMER'S CLASSIFICATION - CONVNEXT TRAINING")
+    print("=" * 80)
+    print(f"Model: ConvNeXt-{Config.MODEL_SIZE}")
+    print(f"Target: >0.8 Test Accuracy")
+    print(f"Data: {Config.DATA_ROOT}")
+    print("=" * 80 + "\n")
+
+    # Setup
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"✓ Device: {device}")
+
+    if torch.cuda.is_available():
+        print(f"✓ GPU: {torch.cuda.get_device_name(0)}")
+        print(f"✓ Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+
+    # Load data
+    print("\n📊 Loading data...")
     train_loader, val_loader, test_loader = create_dataloaders(
         data_root=Config.DATA_ROOT,
         batch_size=Config.BATCH_SIZE,
@@ -311,39 +301,44 @@ def train_model():
         num_workers=Config.NUM_WORKERS
     )
 
-    # Create model
-    print("\n" + "=" * 80)
-    print("CREATING MODEL")
-    print("=" * 80)
-    model = create_alzheimer_model(
-        model_size=Config.MODEL_SIZE,
-        pretrained=True,
-        dropout=Config.DROPOUT,
-        device=device
-    )
+    print(f"✓ Train: {len(train_loader.dataset)} | Val: {len(val_loader.dataset)} | Test: {len(test_loader.dataset)}")
 
-    # Loss function with class weights and label smoothing
+    # Create model
+    print("\n🏗️  Building model...")
+    model = create_alzheimer_model()
+    model = model.to(device)
+
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"✓ Total parameters: {total_params:,}")
+    print(f"✓ Trainable parameters: {trainable_params:,}")
+
+    # Loss & metrics
     class_weights = torch.tensor(Config.CLASS_WEIGHTS, dtype=torch.float32).to(device)
     criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=Config.LABEL_SMOOTHING)
-
-    # Mixed precision scaler
-    scaler = GradScaler() if Config.USE_MIXED_PRECISION else None
-
-    # Metrics tracker
     tracker = MetricsTracker()
 
+    # Mixed precision scaler
+    scaler = GradScaler() if Config.USE_MIXED_PRECISION and device.type == 'cuda' else None
+    if scaler:
+        print("✓ Mixed precision training enabled (AMP)")
+
     # ------------------------------------------------------------------------------------------------------------------
-    # PHASE 1: Train classifier head only (frozen backbone)
+    # PHASE 1: Train only classifier head (frozen backbone)
     # ------------------------------------------------------------------------------------------------------------------
     print("\n" + "=" * 80)
-    print("PHASE 1: TRAINING CLASSIFIER HEAD (FROZEN BACKBONE)")
+    print("PHASE 1: CLASSIFIER HEAD TRAINING (FROZEN BACKBONE)")
     print("=" * 80)
     print(f"Epochs: {Config.PHASE1_EPOCHS} | LR: {Config.PHASE1_LR}")
     print("=" * 80)
 
     model.freeze_backbone(freeze=True)
-    optimizer = optim.AdamW(model.parameters(), lr=Config.PHASE1_LR, weight_decay=Config.WEIGHT_DECAY)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=3, verbose=True)
+    optimizer = optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=Config.PHASE1_LR,
+        weight_decay=Config.WEIGHT_DECAY
+    )
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=Config.PHASE1_EPOCHS, eta_min=1e-6)
 
     best_val_acc = 0.0
     patience_counter = 0
@@ -360,7 +355,7 @@ def train_model():
         val_loss, val_acc = val_metrics['loss'], val_metrics['accuracy']
 
         # Update scheduler
-        scheduler.step(val_acc)
+        scheduler.step()
         current_lr = optimizer.param_groups[0]['lr']
 
         # Update tracker
@@ -374,7 +369,7 @@ def train_model():
             f"  Precision: {val_metrics['precision']:.4f} | Recall: {val_metrics['recall']:.4f} | F1: {val_metrics['f1']:.4f}")
         print(f"  LR: {current_lr:.2e}")
 
-        # Save best model
+        # Save best model - FIXED: Convert Config to dict properly
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             torch.save({
@@ -382,7 +377,7 @@ def train_model():
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_acc': val_acc,
-                'config': vars(Config)
+                'config': {k: str(v) for k, v in vars(Config).items() if not k.startswith('_')}
             }, Config.CHECKPOINT_DIR / 'best_model_phase1.pth')
             print(f"  ✓ New best model saved! (Val Acc: {val_acc:.4f})")
             patience_counter = 0
@@ -445,7 +440,7 @@ def train_model():
             f"  Precision: {val_metrics['precision']:.4f} | Recall: {val_metrics['recall']:.4f} | F1: {val_metrics['f1']:.4f}")
         print(f"  LR: {current_lr:.2e}")
 
-        # Save best model
+        # Save best model - FIXED: Convert Config to dict properly
         if val_acc > best_val_acc + Config.MIN_DELTA:
             best_val_acc = val_acc
             torch.save({
@@ -453,7 +448,7 @@ def train_model():
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_acc': val_acc,
-                'config': vars(Config)
+                'config': {k: str(v) for k, v in vars(Config).items() if not k.startswith('_')}
             }, Config.CHECKPOINT_DIR / 'best_model_final.pth')
             print(f"  ✓ New best model saved! (Val Acc: {val_acc:.4f})")
             patience_counter = 0
