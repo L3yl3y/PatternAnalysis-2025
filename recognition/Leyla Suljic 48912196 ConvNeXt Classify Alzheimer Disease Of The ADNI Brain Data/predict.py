@@ -1,49 +1,32 @@
-# ------------------------------------------------------------------------------------------------------------------
-#  ConvNeXt Inference & Visualization Script
-# ------------------------------------------------------------------------------------------------------------------
-#  This script loads the trained model and performs inference on test samples.
-#  Includes visualization of predictions, attention maps, and model interpretability.
-# ------------------------------------------------------------------------------------------------------------------
 import torch
 import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
-import seaborn as sns
+import seaborn as sns # Apparently all this does it just make prettier graphs than matplotlib.
 from pathlib import Path
-from PIL import Image
 import json
 from tqdm import tqdm
-import warnings
-
-warnings.filterwarnings('ignore')
-
-# Import our modules
 from dataset import ADNIDataset, get_transforms
-from modules import ConvNeXtAlzheimer
-
+from modules import ConvNeXtAlzheimer # My neural network I chose the other one the ConvNeXt
 
 # ------------------------------------------------------------------------------------------------------------------
-# CONFIGURATION
+# Preface, what this file is actually doing is just taking my actual trained model and it will then run it to see...
+# how it makes predictions on new test data. So train.py does its training thing, and then the predict.py 
+# is how we will test the validation accuracy for the model.
 # ------------------------------------------------------------------------------------------------------------------
 class PredictConfig:
-    """Prediction configuration"""
+    pathOfModel = './alzheimer_results/checkpoints/best_model_final.pth'
+    rootOfData = './data/ADNI/AD_NC'
+    outputDirectory = Path('./alzheimer_results/predictions')
 
-    # Paths
-    MODEL_PATH = './alzheimer_results/checkpoints/best_model_final.pth'
-    DATA_ROOT = './ADNI/AD_NC'
-    OUTPUT_DIR = Path('./alzheimer_results/predictions')
-
-    # Settings
-    BATCH_SIZE = 1  # Process one at a time for visualization
+    BATCH_SIZE = 1
     IMG_SIZE = 224
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-    # Create output directory
-    OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
-
+    # exist_ok so that if it exists it won't cause problems; and parents = true to make parent folder if you have to.
+    outputDirectory.mkdir(exist_ok = True, parents = True)
 
 # ------------------------------------------------------------------------------------------------------------------
-# MODEL LOADER
+# FYI these all below are kinda helper so they help make this happen pretty much:
 # ------------------------------------------------------------------------------------------------------------------
 def load_trained_model(model_path, device='cuda'):
     """Load the trained ConvNeXt model"""
@@ -342,12 +325,12 @@ def run_predictions():
     print("=" * 80)
 
     # Load model
-    model = load_trained_model(PredictConfig.MODEL_PATH, PredictConfig.DEVICE)
+    model = load_trained_model(PredictConfig.pathOfModel, PredictConfig.DEVICE)
 
     # Load test dataset
     print("\nLoading test dataset...")
     test_dataset = ADNIDataset(
-        data_root=PredictConfig.DATA_ROOT,
+        data_root=PredictConfig.rootOfData,
         mode='test',
         transform=get_transforms('test', PredictConfig.IMG_SIZE),
         img_size=PredictConfig.IMG_SIZE
@@ -375,7 +358,7 @@ def run_predictions():
     print(f"  Accuracy: {accuracy:.4f} ({accuracy * 100:.2f}%)")
 
     # Save results
-    results_path = PredictConfig.OUTPUT_DIR / 'test_predictions.json'
+    results_path = PredictConfig.outputDirectory / 'test_predictions.json'
     with open(results_path, 'w') as f:
         json.dump(results, f, indent=4)
     print(f"\n✓ Results saved to {results_path}")
@@ -389,7 +372,7 @@ def run_predictions():
     print("Creating prediction grid...")
     visualize_multiple_predictions(
         model, test_dataset, num_samples=12,
-        save_path=PredictConfig.OUTPUT_DIR / 'prediction_grid.png'
+        save_path=PredictConfig.outputDirectory / 'prediction_grid.png'
     )
     print("✓ Saved: prediction_grid.png")
 
@@ -397,7 +380,7 @@ def run_predictions():
     print("Plotting confidence distribution...")
     plot_confidence_distribution(
         results,
-        save_path=PredictConfig.OUTPUT_DIR / 'confidence_distribution.png'
+        save_path=PredictConfig.outputDirectory / 'confidence_distribution.png'
     )
     print("✓ Saved: confidence_distribution.png")
 
@@ -405,7 +388,7 @@ def run_predictions():
     print("Creating error analysis...")
     plot_error_analysis(
         results,
-        save_path=PredictConfig.OUTPUT_DIR / 'error_analysis.png'
+        save_path=PredictConfig.outputDirectory / 'error_analysis.png'
     )
     print("✓ Saved: error_analysis.png")
 
@@ -422,13 +405,13 @@ def run_predictions():
     image, label = test_dataset[correct_normal[0]]
     pred, conf, probs = predict_single_image(model, image, PredictConfig.DEVICE)
     visualize_prediction(image, label, pred, probs,
-                         save_path=PredictConfig.OUTPUT_DIR / 'example_correct_normal.png')
+                         save_path=PredictConfig.outputDirectory / 'example_correct_normal.png')
     print("✓ Saved: example_correct_normal.png")
 
     image, label = test_dataset[correct_ad[0]]
     pred, conf, probs = predict_single_image(model, image, PredictConfig.DEVICE)
     visualize_prediction(image, label, pred, probs,
-                         save_path=PredictConfig.OUTPUT_DIR / 'example_correct_ad.png')
+                         save_path=PredictConfig.outputDirectory / 'example_correct_ad.png')
     print("✓ Saved: example_correct_ad.png")
 
     # Find wrong predictions if they exist
@@ -437,13 +420,13 @@ def run_predictions():
         image, label = test_dataset[wrong_examples[0][0]]
         pred, conf, probs = predict_single_image(model, image, PredictConfig.DEVICE)
         visualize_prediction(image, label, pred, probs,
-                             save_path=PredictConfig.OUTPUT_DIR / 'example_wrong_prediction.png')
+                             save_path=PredictConfig.outputDirectory / 'example_wrong_prediction.png')
         print("✓ Saved: example_wrong_prediction.png")
 
     print("\n" + "=" * 80)
     print("INFERENCE COMPLETE! 🎉")
     print("=" * 80)
-    print(f"\nAll results saved to: {PredictConfig.OUTPUT_DIR}")
+    print(f"\nAll results saved to: {PredictConfig.outputDirectory}")
     print(f"\nFinal Test Accuracy: {accuracy:.4f} ({accuracy * 100:.2f}%)")
     if accuracy >= 0.8:
         print("✓ TARGET ACCURACY ACHIEVED! (>0.8)")
@@ -464,11 +447,11 @@ def interactive_demo():
     print("=" * 80)
 
     # Load model
-    model = load_trained_model(PredictConfig.MODEL_PATH, PredictConfig.DEVICE)
+    model = load_trained_model(PredictConfig.pathOfModel, PredictConfig.DEVICE)
 
     # Load test dataset
     test_dataset = ADNIDataset(
-        data_root=PredictConfig.DATA_ROOT,
+        data_root=PredictConfig.rootOfData,
         mode='test',
         transform=get_transforms('test', PredictConfig.IMG_SIZE),
         img_size=PredictConfig.IMG_SIZE
