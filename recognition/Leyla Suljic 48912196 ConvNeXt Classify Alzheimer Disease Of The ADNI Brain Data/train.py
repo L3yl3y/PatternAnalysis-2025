@@ -12,9 +12,10 @@ import json
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, roc_auc_score, roc_curve
 from dataset import create_dataloaders
 from modules import create_alzheimer_model
-    # ------------------------------------------------------------------------------------------------------------------
-    # Preface: this code isn't all too exciting a lot of it does involve 
-    # ------------------------------------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------------------------
+# Preface: this code isn't all too exciting a lot of it does involve a lot of printing because I like being able to
+# see my metrics in a human readable format :3
+# ------------------------------------------------------------------------------------------------------------------
 class Config:
     DATA_ROOT = './data/ADNI/AD_NC'
     BATCH_SIZE = 16
@@ -123,37 +124,29 @@ class MetricsTracker: # Metrics for printing and showing pretty things :3
         plt.close()
 
 # ------------------------------------------------------------------------------------------------------------------
-# TRAINING & EVALUATION FUNCTIONS
-# ------------------------------------------------------------------------------------------------------------------
-def train_one_epoch(model, dataloader, criterion, optimizer, device, scaler=None, epoch=1, phase='Phase1'):
-    """Train for one epoch"""
+def train_one_epoch(model, dataloader, criterion, optimizer, device, scaler = None, epoch = 1, phase = 'Phase1'):
     model.train()
     running_loss = 0.0
     all_preds = []
     all_labels = []
-
-    pbar = tqdm(dataloader, desc=f'{phase} Epoch {epoch} [TRAIN]')
+    pbar = tqdm(dataloader, desc = f'{phase} Epoch {epoch} [TRAIN]')
 
     for images, labels in pbar:
-        images = images.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
+        images = images.to(device, non_blocking = True)
+        labels = labels.to(device, non_blocking = True)
+        optimizer.zero_grad(set_to_none = True)
 
-        optimizer.zero_grad(set_to_none=True)  # More efficient than zero_grad()
-
-        # Mixed precision training
         if scaler is not None:
-            with autocast(device_type='cuda'):
+            with autocast(device_type = 'cuda'):
                 outputs = model(images)
                 loss = criterion(outputs, labels)
 
             scaler.scale(loss).backward()
-
-            # Gradient clipping
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), Config.GRADIENT_CLIP)
-
             scaler.step(optimizer)
             scaler.update()
+
         else:
             outputs = model(images)
             loss = criterion(outputs, labels)
@@ -161,23 +154,18 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, scaler=None
             torch.nn.utils.clip_grad_norm_(model.parameters(), Config.GRADIENT_CLIP)
             optimizer.step()
 
-        # Track metrics
         running_loss += loss.item() * images.size(0)
-        preds = torch.argmax(outputs, dim=1)
+        preds = torch.argmax(outputs, dim = 1)
         all_preds.extend(preds.cpu().numpy())
         all_labels.extend(labels.cpu().numpy())
-
-        # Update progress bar
         pbar.set_postfix({'loss': loss.item()})
 
     epoch_loss = running_loss / len(dataloader.dataset)
     epoch_acc = accuracy_score(all_labels, all_preds)
-
     return epoch_loss, epoch_acc
 
-
-def evaluate(model, dataloader, criterion, device, split='Val'):
-    """Evaluate model"""
+# ------------------------------------------------------------------------------------------------------------------
+def evaluate(model, dataloader, criterion, device, split = 'Val'):
     model.eval()
     running_loss = 0.0
     all_preds = []
@@ -185,30 +173,25 @@ def evaluate(model, dataloader, criterion, device, split='Val'):
     all_probs = []
 
     with torch.no_grad():
-        for images, labels in tqdm(dataloader, desc=f'[{split}]'):
-            images = images.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
-
+        for images, labels in tqdm(dataloader, desc = f'[{split}]'):
+            images = images.to(device, non_blocking = True)
+            labels = labels.to(device, non_blocking = True)
             outputs = model(images)
             loss = criterion(outputs, labels)
-
             running_loss += loss.item() * images.size(0)
-            probs = torch.softmax(outputs, dim=1)[:, 1]  # Probability of AD class
-            preds = torch.argmax(outputs, dim=1)
-
+            probs = torch.softmax(outputs, dim = 1)[:, 1]  # Probability of AD class
+            preds = torch.argmax(outputs, dim = 1)
             all_probs.extend(probs.cpu().numpy())
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
-
     epoch_loss = running_loss / len(dataloader.dataset)
 
-    # Calculate metrics
     metrics = {
         'loss': epoch_loss,
         'accuracy': accuracy_score(all_labels, all_preds),
-        'precision': precision_score(all_labels, all_preds, zero_division=0),
-        'recall': recall_score(all_labels, all_preds, zero_division=0),
-        'f1': f1_score(all_labels, all_preds, zero_division=0),
+        'precision': precision_score(all_labels, all_preds, zero_division = 0),
+        'recall': recall_score(all_labels, all_preds, zero_division = 0),
+        'f1': f1_score(all_labels, all_preds, zero_division = 0),
         'auc': roc_auc_score(all_labels, all_probs) if len(np.unique(all_labels)) > 1 else 0.0,
         'predictions': all_preds,
         'labels': all_labels,
@@ -217,59 +200,24 @@ def evaluate(model, dataloader, criterion, device, split='Val'):
 
     return metrics
 
-
 # ------------------------------------------------------------------------------------------------------------------
-def train_model():
-    """Main training pipeline"""
-    print("\n" + "=" * 80)
-    print("ALZHEIMER'S CLASSIFICATION - CONVNEXT TRAINING")
-    print("=" * 80)
-    print(f"Model: ConvNeXt-{Config.MODEL_SIZE}")
-    print(f"Target: >0.8 Test Accuracy")
-    print(f"Data: {Config.DATA_ROOT}")
-    print("=" * 80 + "\n")
-
-    # Setup
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"✓ Device: {device}")
-
-    if torch.cuda.is_available():
-        print(f"✓ GPU: {torch.cuda.get_device_name(0)}")
-        print(f"✓ Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
-
-    # Load data
-    print("\n📊 Loading data...")
+def train_model(): # With many plotting functions.
     train_loader, val_loader, test_loader = create_dataloaders(
-        data_root=Config.DATA_ROOT,
-        batch_size=Config.BATCH_SIZE,
-        img_size=Config.IMG_SIZE,
-        num_workers=Config.NUM_WORKERS
+        data_root = Config.DATA_ROOT,
+        batch_size= Config.BATCH_SIZE,
+        img_size = Config.IMG_SIZE,
+        num_workers = Config.NUM_WORKERS
     )
 
-    print(f"✓ Train: {len(train_loader.dataset)} | Val: {len(val_loader.dataset)} | Test: {len(test_loader.dataset)}")
-
-    # Create model
-    print("\n🏗️  Building model...")
     model = create_alzheimer_model()
     model = model.to(device)
-
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"✓ Total parameters: {total_params:,}")
-    print(f"✓ Trainable parameters: {trainable_params:,}")
-
-    # Loss & metrics
-    class_weights = torch.tensor(Config.CLASS_WEIGHTS, dtype=torch.float32).to(device)
-    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=Config.LABEL_SMOOTHING)
+    class_weights = torch.tensor(Config.CLASS_WEIGHTS, dtype = torch.float32).to(device)
+    criterion = nn.CrossEntropyLoss(weight = class_weights, label_smoothing = Config.LABEL_SMOOTHING)
     tracker = MetricsTracker()
-
-    # Mixed precision scaler
     scaler = GradScaler() if Config.USE_MIXED_PRECISION and device.type == 'cuda' else None
-    if scaler:
-        print("✓ Mixed precision training enabled (AMP)")
 
     # ------------------------------------------------------------------------------------------------------------------
-    # PHASE 1: Train only classifier head (frozen backbone)
+    # PHASE 1: FROZEN BACKBONE PHASE 1 BTW!
     # ------------------------------------------------------------------------------------------------------------------
     print("\n" + "=" * 80)
     print("PHASE 1: CLASSIFIER HEAD TRAINING (FROZEN BACKBONE)")
@@ -277,44 +225,37 @@ def train_model():
     print(f"Epochs: {Config.PHASE1_EPOCHS} | LR: {Config.PHASE1_LR}")
     print("=" * 80)
 
-    model.freeze_backbone(freeze=True)
+    model.freeze_backbone(freeze = True)
     optimizer = optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
-        lr=Config.PHASE1_LR,
-        weight_decay=Config.WEIGHT_DECAY
+        lr = Config.PHASE1_LR,
+        weight_decay = Config.WEIGHT_DECAY
     )
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=Config.PHASE1_EPOCHS, eta_min=1e-6)
 
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max = Config.PHASE1_EPOCHS, eta_min = 1e-6)
     best_val_acc = 0.0
     patience_counter = 0
     start_time = time.time()
 
     for epoch in range(1, Config.PHASE1_EPOCHS + 1):
-        # Train
         train_loss, train_acc = train_one_epoch(
             model, train_loader, criterion, optimizer, device, scaler, epoch, 'Phase1'
         )
 
-        # Validate
         val_metrics = evaluate(model, val_loader, criterion, device, 'Val')
         val_loss, val_acc = val_metrics['loss'], val_metrics['accuracy']
-
-        # Update scheduler
         scheduler.step()
         current_lr = optimizer.param_groups[0]['lr']
-
-        # Update tracker
         tracker.update(train_loss, val_loss, train_acc, val_acc, current_lr)
 
         # Print epoch results
         print(f"\nEpoch {epoch}/{Config.PHASE1_EPOCHS}:")
         print(f"  Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f}")
         print(f"  Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
-        print(
-            f"  Precision: {val_metrics['precision']:.4f} | Recall: {val_metrics['recall']:.4f} | F1: {val_metrics['f1']:.4f}")
+        print(f"  Precision: {val_metrics['precision']:.4f} | Recall: {val_metrics['recall']:.4f} | F1: {val_metrics['f1']:.4f}")
         print(f"  LR: {current_lr:.2e}")
 
-        # Save best model - FIXED: Convert Config to dict properly
+        # Save best model:
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             torch.save({
@@ -339,7 +280,8 @@ def train_model():
     print(f"  Best Val Acc: {best_val_acc:.4f}")
 
     # ------------------------------------------------------------------------------------------------------------------
-    # PHASE 2: Fine-tune entire model (unfreeze backbone)
+    # PHASE 2: FINE TUNE STUFF PHASE 2 UNFROZEN BTW:
+    # Super similar to phase 1.
     # ------------------------------------------------------------------------------------------------------------------
     print("\n" + "=" * 80)
     print("PHASE 2: FULL MODEL FINE-TUNING (UNFROZEN BACKBONE)")
@@ -347,45 +289,32 @@ def train_model():
     print(f"Epochs: {Config.PHASE2_EPOCHS} | LR: {Config.PHASE2_LR}")
     print("=" * 80)
 
-    # Load best Phase 1 model
-    checkpoint = torch.load(Config.CHECKPOINT_DIR / 'best_model_phase1.pth')
+    checkpoint = torch.load(Config.CHECKPOINT_DIR / 'best_model_phase1.pth') # Load best phase 1 model.
     model.load_state_dict(checkpoint['model_state_dict'])
     print(f"✓ Loaded best Phase 1 model (Val Acc: {checkpoint['val_acc']:.4f})")
 
-    model.freeze_backbone(freeze=False)
-    optimizer = optim.AdamW(model.parameters(), lr=Config.PHASE2_LR, weight_decay=Config.WEIGHT_DECAY)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=Config.PHASE2_EPOCHS, eta_min=1e-7)
-
+    model.freeze_backbone(freeze = False)
+    optimizer = optim.AdamW(model.parameters(), lr = Config.PHASE2_LR, weight_decay = Config.WEIGHT_DECAY)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max = Config.PHASE2_EPOCHS, eta_min = 1e-7)
     best_val_acc = checkpoint['val_acc']
     patience_counter = 0
     start_time = time.time()
 
     for epoch in range(1, Config.PHASE2_EPOCHS + 1):
-        # Train
-        train_loss, train_acc = train_one_epoch(
-            model, train_loader, criterion, optimizer, device, scaler, epoch, 'Phase2'
-        )
-
-        # Validate
+        train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device, scaler, epoch, 'Phase2')
         val_metrics = evaluate(model, val_loader, criterion, device, 'Val')
         val_loss, val_acc = val_metrics['loss'], val_metrics['accuracy']
-
-        # Update scheduler
         scheduler.step()
         current_lr = optimizer.param_groups[0]['lr']
-
-        # Update tracker
         tracker.update(train_loss, val_loss, train_acc, val_acc, current_lr)
 
-        # Print epoch results
         print(f"\nEpoch {epoch}/{Config.PHASE2_EPOCHS}:")
         print(f"  Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f}")
         print(f"  Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
-        print(
-            f"  Precision: {val_metrics['precision']:.4f} | Recall: {val_metrics['recall']:.4f} | F1: {val_metrics['f1']:.4f}")
+        print(f"  Precision: {val_metrics['precision']:.4f} | Recall: {val_metrics['recall']:.4f} | F1: {val_metrics['f1']:.4f}")
         print(f"  LR: {current_lr:.2e}")
 
-        # Save best model - FIXED: Convert Config to dict properly
+        # Save best model.
         if val_acc > best_val_acc + Config.MIN_DELTA:
             best_val_acc = val_acc
             torch.save({
@@ -400,7 +329,6 @@ def train_model():
         else:
             patience_counter += 1
 
-        # Early stopping
         if patience_counter >= Config.PATIENCE:
             print(f"\n⚠ Early stopping triggered after {epoch} epochs")
             break
@@ -410,32 +338,24 @@ def train_model():
     print(f"  Best Val Acc: {best_val_acc:.4f}")
 
     # ------------------------------------------------------------------------------------------------------------------
-    # FINAL EVALUATION ON TEST SET
-    # ------------------------------------------------------------------------------------------------------------------
     print("\n" + "=" * 80)
     print("FINAL EVALUATION ON TEST SET")
     print("=" * 80)
-
-    # Load best model
     checkpoint = torch.load(Config.CHECKPOINT_DIR / 'best_model_final.pth')
     model.load_state_dict(checkpoint['model_state_dict'])
     print(f"✓ Loaded best model from epoch {checkpoint['epoch']}")
-
-    # Test
     test_metrics = evaluate(model, test_loader, criterion, device, 'Test')
 
     print(f"\n🎯 TEST SET RESULTS:")
     print("=" * 80)
-    print(
-        f"  Accuracy:  {test_metrics['accuracy']:.4f} {'✓ TARGET ACHIEVED!' if test_metrics['accuracy'] >= 0.8 else '✗ Below target'}")
+    print(f"  Accuracy:  {test_metrics['accuracy']:.4f} {'✓ TARGET ACHIEVED!' if test_metrics['accuracy'] >= 0.8 else '✗ Below target'}")
     print(f"  Precision: {test_metrics['precision']:.4f}")
     print(f"  Recall:    {test_metrics['recall']:.4f}")
     print(f"  F1 Score:  {test_metrics['f1']:.4f}")
     print(f"  AUC:       {test_metrics['auc']:.4f}")
     print("=" * 80)
 
-    # Save metrics
-    final_results = {
+    final_results = { # Saving the metrics here.
         'test_accuracy': float(test_metrics['accuracy']),
         'test_precision': float(test_metrics['precision']),
         'test_recall': float(test_metrics['recall']),
@@ -447,19 +367,17 @@ def train_model():
     }
 
     with open(Config.OUTPUT_DIR / 'final_results.json', 'w') as f:
-        json.dump(final_results, f, indent=4)
+        json.dump(final_results, f, indent = 4)
 
-    # Plot training curves
     tracker.plot(Config.PLOTS_DIR / 'training_curves.png')
 
-    # Plot confusion matrix
+    # Plotting here pal:
     plot_confusion_matrix(
         test_metrics['labels'],
         test_metrics['predictions'],
         Config.PLOTS_DIR / 'confusion_matrix.png'
     )
 
-    # Plot ROC curve
     plot_roc_curve(
         test_metrics['labels'],
         test_metrics['probabilities'],
@@ -469,51 +387,36 @@ def train_model():
     print(f"\n✓ All results saved to {Config.OUTPUT_DIR}")
     print("\n" + "=" * 80)
     print("TRAINING COMPLETE! 🎉")
-    print("=" * 80)
+    print("=" * 80) #  With many plotting functios
 
-
-# ------------------------------------------------------------------------------------------------------------------
-# VISUALIZATION FUNCTIONS
 # ------------------------------------------------------------------------------------------------------------------
 def plot_confusion_matrix(y_true, y_pred, save_path):
-    """Plot confusion matrix"""
     cm = confusion_matrix(y_true, y_pred)
-
-    plt.figure(figsize=(8, 6))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', cbar=True,
-                xticklabels=['Normal', 'AD'], yticklabels=['Normal', 'AD'])
-    plt.xlabel('Predicted', fontsize=12)
-    plt.ylabel('True', fontsize=12)
-    plt.title('Confusion Matrix - Test Set', fontsize=14, fontweight='bold')
+    plt.figure(figsize = (8, 6))
+    sns.heatmap(cm, annot = True, fmt = 'd', cmap = 'Blues', cbar = True, xticklabels = ['Normal', 'AD'], yticklabels = ['Normal', 'AD'])
+    plt.xlabel('Predicted', fontsize = 12)
+    plt.ylabel('True', fontsize = 12)
+    plt.title('Confusion Matrix - Test Set', fontsize = 14, fontweight = 'bold')
     plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.savefig(save_path, dpi = 300, bbox_inches = 'tight')
     plt.close()
-
-    print(f"✓ Confusion matrix saved to {save_path}")
-
-
-def plot_roc_curve(y_true, y_probs, save_path):
-    """Plot ROC curve"""
-    fpr, tpr, thresholds = roc_curve(y_true, y_probs)
-    auc = roc_auc_score(y_true, y_probs)
-
-    plt.figure(figsize=(8, 6))
-    plt.plot(fpr, tpr, 'b-', linewidth=2, label=f'ROC Curve (AUC = {auc:.4f})')
-    plt.plot([0, 1], [0, 1], 'r--', linewidth=2, label='Random Classifier')
-    plt.xlabel('False Positive Rate', fontsize=12)
-    plt.ylabel('True Positive Rate', fontsize=12)
-    plt.title('ROC Curve - Test Set', fontsize=14, fontweight='bold')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.close()
-
-    print(f"✓ ROC curve saved to {save_path}")
-
 
 # ------------------------------------------------------------------------------------------------------------------
-# RUN TRAINING
+def plot_roc_curve(y_true, y_probs, save_path):
+    fpr, tpr, thresholds = roc_curve(y_true, y_probs)
+    auc = roc_auc_score(y_true, y_probs)
+    plt.figure(figsize = (8, 6))
+    plt.plot(fpr, tpr, 'b-', linewidth = 2, label = f'ROC Curve (AUC = {auc:.4f})')
+    plt.plot([0, 1], [0, 1], 'r--', linewidth=2, label = 'Random Classifier')
+    plt.xlabel('False Positive Rate', fontsize=12)
+    plt.ylabel('True Positive Rate', fontsize = 12)
+    plt.title('ROC Curve - Test Set', fontsize = 14, fontweight = 'bold')
+    plt.legend()
+    plt.grid(True, alpha = 0.3)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi = 300, bbox_inches = 'tight')
+    plt.close()
+
 # ------------------------------------------------------------------------------------------------------------------
 if __name__ == '__main__':
     train_model()
