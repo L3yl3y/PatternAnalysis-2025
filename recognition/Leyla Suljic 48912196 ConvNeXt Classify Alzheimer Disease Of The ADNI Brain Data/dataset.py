@@ -1,44 +1,77 @@
 from torch.utils.data import Dataset, DataLoader
 from pathlib import Path
-from PIL import Image
+from PIL import Image, ImageEnhance
 import torchvision.transforms as transforms
 from sklearn.model_selection import train_test_split
+import numpy as np
+import cv2
 
 # ------------------------------------------------------------------------------------------------------------------
-# This pretty much is just to run through the dataset and load the images and their labels - nothing exciting.
+# NEW: CLAHE preprocessing inspired by the paper
+# ------------------------------------------------------------------------------------------------------------------
+class CLAHETransform:
+    """
+    Contrast Limited Adaptive Histogram Equalization
+    Improves local contrast and highlights subtle features
+    Critical for medical imaging!
+    """
+    def __init__(self, clip_limit=2.0, tile_grid_size=(8, 8)):
+        self.clip_limit = clip_limit
+        self.tile_grid_size = tile_grid_size
+    
+    def __call__(self, img):
+        # Convert PIL to numpy
+        img_np = np.array(img)
+        
+        # Apply CLAHE to each channel
+        clahe = cv2.createCLAHE(clipLimit=self.clip_limit, tileGridSize=self.tile_grid_size)
+        
+        if len(img_np.shape) == 2:  # Grayscale
+            img_np = clahe.apply(img_np)
+        else:  # RGB
+            # Convert to LAB color space for better results
+            lab = cv2.cvtColor(img_np, cv2.COLOR_RGB2LAB)
+            lab[:, :, 0] = clahe.apply(lab[:, :, 0])  # Apply only to L channel
+            img_np = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+        
+        return Image.fromarray(img_np)
+
+
+# ------------------------------------------------------------------------------------------------------------------
+# Enhanced Dataset with CLAHE option
 # ------------------------------------------------------------------------------------------------------------------
 class ADNIDataset(Dataset):
-    def __init__(self, data_root, mode = 'train', transform = None, img_size = 224):
+    def __init__(self, data_root, mode='train', transform=None, img_size=224, use_clahe=True):
         self.data_root = Path(data_root)
         self.mode = mode
         self.transform = transform
         self.img_size = img_size
+        self.use_clahe = use_clahe
         self.samples = self._load_file_paths()
     
     def _load_file_paths(self):
-        samples = [] # Empty list which will store both (image path, label) tuples.
-        split_dir = self.data_root / self.mode # Kinda gross but this splits directory into train NC/test AD/test NC/train AD.
+        samples = []
+        split_dir = self.data_root / self.mode
         
         if not split_dir.exists():
-            raise ValueError(f"Directory {split_dir} not found!") # Safety slop.
+            raise ValueError(f"Directory {split_dir} not found!")
         
-        # Load AD samples - these are of the alzheimers disease - these will get label 1.
+        # Load AD samples (label 1)
         ad_dir = split_dir / 'AD'
-        if ad_dir.exists(): # Only processes of the actual AD directory exists --> which it should fyi lmao.
-            ad_files = list(ad_dir.glob('*.jpg')) + list(ad_dir.glob('*.jpeg')) # This just finds all .jpg and .jpeg files.
-            samples.extend([(str(f), 1) for f in ad_files]) # Would look something this: samples = [('/path/to/ad1.jpg', 1), ('/path/to/ad2.jpg', 1), ...].
+        if ad_dir.exists():
+            ad_files = list(ad_dir.glob('*.jpg')) + list(ad_dir.glob('*.jpeg')) + list(ad_dir.glob('*.png'))
+            samples.extend([(str(f), 1) for f in ad_files])
         
-        # Load NC samples - these are normal brains as like a scientific experiment control group.
-        # This is gonna get label 0 btw.
-        for folder_name in ['NC', 'CN']: # Same concept above but just different .jpg/.jpeg file brain type.
+        # Load NC samples (label 0)
+        for folder_name in ['NC', 'CN', 'Normal']:
             normal_dir = split_dir / folder_name
             if normal_dir.exists():
-                normal_files = list(normal_dir.glob('*.jpg')) + list(normal_dir.glob('*.jpeg'))
+                normal_files = list(normal_dir.glob('*.jpg')) + list(normal_dir.glob('*.jpeg')) + list(normal_dir.glob('*.png'))
                 samples.extend([(str(f), 0) for f in normal_files])
                 break
         
         if len(samples) == 0:
-            raise ValueError(f"No images found in {split_dir}!") # Not really necessary but safety slop regardless.
+            raise ValueError(f"No images found in {split_dir}!")
         
         return samples
     
@@ -47,108 +80,160 @@ class ADNIDataset(Dataset):
     
     def __getitem__(self, idx):
         img_path, label = self.samples[idx]
-        img = Image.open(img_path).convert('RGB') # Image open to actually read the jpeg file.
+        img = Image.open(img_path).convert('RGB')
         
+        # Resize first
         if img.size != (self.img_size, self.img_size):
-            # Image.LANCZOS is just a high-quality downsampling filter (apparently its good for medical images).
             img = img.resize((self.img_size, self.img_size), Image.LANCZOS)
         
+        # Apply CLAHE preprocessing if enabled (BEFORE augmentation)
+        # This is KEY from the paper!
+        if self.use_clahe and self.mode == 'train':
+            clahe_transform = CLAHETransform(clip_limit=2.0, tile_grid_size=(8, 8))
+            img = clahe_transform(img)
+        
+        # Apply augmentation/normalization transforms
         if self.transform:
-            img = self.transform(img) # Apply the transforms we'll have defined later (in get_transforms()).
+            img = self.transform(img)
         
         return img, label
 
-# ------------------------------------------------------------------------------------------------------------------
-# TRANSFORMS!! --> This alters the images slightly to make the model smarter so it has more variety in the data.
-# ------------------------------------------------------------------------------------------------------------------
-def get_transforms(mode = 'train', img_size = 224):
-    # I refuse to have ugly code.
-    # Fyi we don't need to have horizontal modifications because the data is already centered perfectly.
-    # If anything it would just cause training to take longer which is gross.
 
+# ------------------------------------------------------------------------------------------------------------------
+# Enhanced transforms with paper's strategy
+# ------------------------------------------------------------------------------------------------------------------
+def get_transforms(mode='train', img_size=224):
     if mode == 'train':
+        # Strong augmentation matching the paper's strategy
         return transforms.Compose([
-            transforms.ColorJitter(brightness = 0.2, contrast = 0.2),
+            # Geometric augmentations
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomRotation(degrees=15),
+            transforms.RandomAffine(
+                degrees=0,
+                translate=(0.1, 0.1),
+                scale=(0.9, 1.1),
+                shear=5
+            ),
+            
+            # Color augmentations (more aggressive for medical images)
+            transforms.ColorJitter(
+                brightness=0.3,
+                contrast=0.3,
+                saturation=0.2,
+                hue=0.05
+            ),
+            
+            # Occasionally convert to grayscale (forces robust features)
+            transforms.RandomGrayscale(p=0.1),
+            
+            # Advanced augmentations
+            transforms.RandomPerspective(distortion_scale=0.2, p=0.3),
+            transforms.RandomApply([
+                transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0))
+            ], p=0.3),
+            
+            # Convert to tensor and normalize
             transforms.ToTensor(),
-            transforms.Normalize(mean = [0.485, 0.456, 0.406], std = [0.229, 0.224, 0.225])
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            
+            # Random erasing (cutout) - forces model to use multiple regions
+            transforms.RandomErasing(
+                p=0.3,
+                scale=(0.02, 0.15),
+                ratio=(0.3, 3.3),
+                value='random'
+            )
         ])
     
-    else:
+    else:  # val or test
+        # No augmentation, just normalization
         return transforms.Compose([
             transforms.Resize((img_size, img_size)),
             transforms.ToTensor(),
-            transforms.Normalize(mean = [0.485, 0.456, 0.406], std = [0.229, 0.224, 0.225])
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
 
+
 # ------------------------------------------------------------------------------------------------------------------
-# DATALOADER - this is what actually feeds the data into the model we train.
-# What this should do is split the training into train + validation and then load the data (our odds are 85%/15%).
+# Dataloader creation
 # ------------------------------------------------------------------------------------------------------------------
-def create_dataloaders(data_root, batch_size = 16, img_size = 224, num_workers = 8, val_split = 0.15):
-    # Increased number of workers to 8 for better data transfer (I did that in demo2 it worked well).
-    train_full = ADNIDataset(data_root, mode = 'train', transform = None, img_size = img_size)
+def create_dataloaders(data_root, batch_size=16, img_size=224, num_workers=8, val_split=0.15, use_clahe=True):
+    """
+    Creates train, val, and test dataloaders
     
-    # Load test data; I know its gross all being in a line like this idgaf.
-    test_dataset = ADNIDataset(data_root, mode = 'test', transform = get_transforms('test', img_size), img_size = img_size)
-    # Note, the test_dataset is like the final exam and should only be after the model has trained.
+    Args:
+        use_clahe: Whether to use CLAHE preprocessing (recommended for medical images)
+    """
+    train_full = ADNIDataset(data_root, mode='train', transform=None, img_size=img_size, use_clahe=False)
+    test_dataset = ADNIDataset(data_root, mode='test', transform=get_transforms('test', img_size), 
+                               img_size=img_size, use_clahe=False)
     
-    # This is where we split the training into those training + testing aspect.
     train_paths = [sample[0] for sample in train_full.samples]
     train_labels = [sample[1] for sample in train_full.samples]
     
     train_paths, val_paths, train_labels, val_labels = train_test_split(
         train_paths, train_labels,
-        test_size = val_split,
-        stratify = train_labels,
-        random_state = 42
+        test_size=val_split,
+        stratify=train_labels,
+        random_state=42
     )
     
-    # Train dataset with transforms and augmentations.
+    # Train dataset with CLAHE + strong augmentation
     train_dataset = ADNIDataset.__new__(ADNIDataset)
     train_dataset.__dict__.update({
         'data_root': Path(data_root),
         'mode': 'train',
         'transform': get_transforms('train', img_size),
         'img_size': img_size,
+        'use_clahe': use_clahe,
         'samples': list(zip(train_paths, train_labels))
     })
     
-    # Create validation dataset (no augmentation).
+    # Validation dataset (no augmentation, no CLAHE)
     val_dataset = ADNIDataset.__new__(ADNIDataset)
     val_dataset.__dict__.update({
         'data_root': Path(data_root),
         'mode': 'train',
         'transform': get_transforms('val', img_size),
         'img_size': img_size,
+        'use_clahe': False,  # No CLAHE for validation
         'samples': list(zip(val_paths, val_labels))
     })
     
-    # Print dataset statistics
-    print(f"\nTrain: {len(train_dataset)} | Val: {len(val_dataset)} | Test: {len(test_dataset)}")
+    print(f"\n📊 Dataset loaded:")
+    print(f"   Train: {len(train_dataset)} samples")
+    print(f"   Val:   {len(val_dataset)} samples")
+    print(f"   Test:  {len(test_dataset)} samples")
+    if use_clahe:
+        print(f"   🔬 CLAHE preprocessing: ENABLED (like the paper!)")
     
-    # These are the three sets of dataloaders fyi so - train, validate, and final test (in this order).
+    # Create dataloaders
     train_loader = DataLoader(
         train_dataset,
-        batch_size = batch_size,
-        shuffle = True,
-        num_workers = num_workers,
-        pin_memory = True
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=True if num_workers > 0 else False
     )
     
     val_loader = DataLoader(
         val_dataset,
-        batch_size = batch_size,
-        shuffle = False,
-        num_workers = num_workers,
-        pin_memory = True
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=True if num_workers > 0 else False
     )
     
     test_loader = DataLoader(
         test_dataset,
-        batch_size = batch_size,
-        shuffle = False,
-        num_workers = num_workers,
-        pin_memory = True
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=True if num_workers > 0 else False
     )
     
     return train_loader, val_loader, test_loader

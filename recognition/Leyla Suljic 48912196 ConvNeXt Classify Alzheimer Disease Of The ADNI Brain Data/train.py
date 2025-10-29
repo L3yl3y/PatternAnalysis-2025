@@ -17,9 +17,6 @@ from modules import create_alzheimer_model
 # Preface: this code isn't all too exciting a lot of it does involve a lot of printing because I like being able to
 # see my metrics in a human readable format :3
 # ------------------------------------------------------------------------------------------------------------------
-
-print("IT IS PREPARING TO RUN RUN RUN! DO NOT FRET IT WILL BEGIN SOON YAY!...")
-print("Loading required modules and preparing environment...")
 class FocalLoss(nn.Module):
     def __init__(self, alpha = 0.75, gamma = 2.0):
         super(FocalLoss, self).__init__()
@@ -35,19 +32,19 @@ class FocalLoss(nn.Module):
 # ------------------------------------------------------------------------------------------------------------------
 class Config:
     DATA_ROOT = './data/ADNI/AD_NC'
-    BATCH_SIZE = 16
+    BATCH_SIZE = 24
     IMG_SIZE = 224
     NUM_WORKERS = 8
     MODEL_SIZE = 'base'
-    DROPOUT = 0.4
+    DROPOUT = 0.35
 
-    PHASE1_EPOCHS = 15
-    PHASE1_LR = 1e-3
+    PHASE1_EPOCHS = 8
+    PHASE1_LR = 1.5e-3
     
-    PHASE2_EPOCHS = 50
-    PHASE2_LR = 5e-6
+    PHASE2_EPOCHS = 20
+    PHASE2_LR = 2e-5
     WEIGHT_DECAY = 1e-4
-    PATIENCE = 15
+    PATIENCE = 7
     MIN_DELTA = 0.001
     USE_MIXED_PRECISION = True
     GRADIENT_CLIP = 1.0
@@ -58,7 +55,8 @@ class Config:
     FOCAL_ALPHA = 0.75
     FOCAL_GAMMA = 2.0
     USE_BALANCED_SAMPLING = True
-    OPTIMIZE_THRESHOLD = True
+    USE_ONECYCLE = True
+    FAST_THRESHOLD = True
     TARGET_RECALL = 0.85
 
     OUTPUT_DIR = Path('./alzheimer_results')
@@ -97,8 +95,6 @@ class MetricsTracker:
         fig, axes = plt.subplots(2, 2, figsize = (15, 10))
         epochs = range(1, len(self.train_losses) + 1)
 
-        # ------------------------------------------------------------------------------------------------------------------
-        # PLOT 1: Loss plot.
         axes[0, 0].plot(epochs, self.train_losses, 'b-', label = 'Train Loss', linewidth = 2)
         axes[0, 0].plot(epochs, self.val_losses, 'r-', label = 'Val Loss', linewidth = 2)
         axes[0, 0].axvline(self.best_epoch + 1, color = 'g', linestyle = '--', alpha = 0.5, label = f'Best Epoch ({self.best_epoch + 1})')
@@ -108,8 +104,6 @@ class MetricsTracker:
         axes[0, 0].legend()
         axes[0, 0].grid(True, alpha = 0.3)
 
-        # ------------------------------------------------------------------------------------------------------------------
-        # PLOT 2: Accuracy plot.
         axes[0, 1].plot(epochs, self.train_accs, 'b-', label = 'Train Acc', linewidth = 2)
         axes[0, 1].plot(epochs, self.val_accs, 'r-', label = 'Val Acc', linewidth = 2)
         axes[0, 1].axvline(self.best_epoch + 1, color = 'g', linestyle = '--', alpha = 0.5, label = f'Best Epoch ({self.best_epoch + 1})')
@@ -121,8 +115,6 @@ class MetricsTracker:
         axes[0, 1].legend()
         axes[0, 1].grid(True, alpha = 0.3)
 
-        # ------------------------------------------------------------------------------------------------------------------
-        # PLOT 3: Recall (AD Detection).
         axes[1, 0].plot(epochs, self.val_recalls, 'purple', linewidth = 2, label = 'Val Recall')
         axes[1, 0].axhline(0.85, color = 'orange', linestyle = '--', alpha = 0.5, label = 'Target (0.85)')
         axes[1, 0].set_xlabel('Epoch', fontsize = 12)
@@ -131,8 +123,6 @@ class MetricsTracker:
         axes[1, 0].legend()
         axes[1, 0].grid(True, alpha = 0.3)
 
-        # ------------------------------------------------------------------------------------------------------------------
-        # PLOT 4: Summary text.
         summary_text = f"""
             Best Validation Accuracy: {self.best_val_acc:.4f}
             Best Epoch: {self.best_epoch + 1}
@@ -159,7 +149,7 @@ def create_balanced_sampler(dataset):
     return WeightedRandomSampler(weights = sample_weights, num_samples = len(sample_weights), replacement = True)
 
 # ------------------------------------------------------------------------------------------------------------------
-def train_one_epoch(model, dataloader, criterion, optimizer, device, scaler = None, epoch = 1, phase = 'Phase1'):
+def train_one_epoch(model, dataloader, criterion, optimizer, device, scaler = None, scheduler = None, epoch = 1, phase = 'Phase1'):
     model.train()
     running_loss = 0.0
     all_preds = []
@@ -189,6 +179,9 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, scaler = No
             torch.nn.utils.clip_grad_norm_(model.parameters(), Config.GRADIENT_CLIP)
             optimizer.step()
 
+        if scheduler is not None and Config.USE_ONECYCLE:
+            scheduler.step()
+
         running_loss += loss.item() * images.size(0)
         preds = torch.argmax(outputs, dim = 1)
         all_preds.extend(preds.cpu().numpy())
@@ -208,7 +201,7 @@ def evaluate(model, dataloader, criterion, device, split = 'Val', threshold = 0.
     all_probs = []
 
     with torch.no_grad():
-        for images, labels in tqdm(dataloader, desc = f'[{split}]'):
+        for images, labels in tqdm(dataloader, desc = f'[{split}]', leave = False):
             images = images.to(device, non_blocking = True)
             labels = labels.to(device, non_blocking = True)
             outputs = model(images)
@@ -235,25 +228,10 @@ def evaluate(model, dataloader, criterion, device, split = 'Val', threshold = 0.
     return metrics
 
 # ------------------------------------------------------------------------------------------------------------------
-def find_optimal_threshold(model, dataloader, device, target_recall = 0.85):
-    model.eval()
-    all_probs = []
-    all_labels = []
-
-    with torch.no_grad():
-        for images, labels in tqdm(dataloader, desc = '[THRESHOLD OPT]'):
-            images = images.to(device)
-            outputs = model(images)
-            probs = torch.softmax(outputs, dim = 1)[:, 1]
-            all_probs.extend(probs.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
-
-    all_probs = np.array(all_probs)
-    all_labels = np.array(all_labels)
+def find_optimal_threshold_fast(all_probs, all_labels, target_recall = 0.85):
     best_threshold = 0.5
     best_acc = 0.0
-
-    for threshold in np.arange(0.3, 0.7, 0.01):
+    for threshold in np.arange(0.35, 0.60, 0.02):
         preds = (all_probs >= threshold).astype(int)
         recall = recall_score(all_labels, preds, zero_division = 0)
         if recall >= target_recall:
@@ -261,22 +239,20 @@ def find_optimal_threshold(model, dataloader, device, target_recall = 0.85):
             if acc > best_acc:
                 best_acc = acc
                 best_threshold = threshold
-
-    print(f"\nOptimal threshold: {best_threshold:.3f}")
-    print(f"  Achieves recall: {recall_score(all_labels, (all_probs >= best_threshold).astype(int)):.3f}")
-    print(f"  With accuracy: {best_acc:.3f}")
     return best_threshold
 
 # ------------------------------------------------------------------------------------------------------------------
 def train_model():
     print("=" * 80)
-    print("OPTIMIZED ALZHEIMER'S CLASSIFICATION")
+    print("FAST OPTIMIZED ALZHEIMER'S CLASSIFICATION")
+    print("TARGET: 85%+ ACCURACY IN ~30 MINUTES!")
     print("=" * 80)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
     if device.type == 'cuda':
         print(f"GPU: {torch.cuda.get_device_name(0)}")
+        torch.backends.cudnn.benchmark = True
 
     print(f"\nLoading data from {Config.DATA_ROOT}")
     train_loader, val_loader, test_loader = create_dataloaders(
@@ -312,13 +288,10 @@ def train_model():
     scaler = GradScaler() if Config.USE_MIXED_PRECISION and device.type == 'cuda' else None
     tracker = MetricsTracker()
 
-    # ------------------------------------------------------------------------------------------------------------------
-    # PHASE 1: FROZEN STUFF PHASE 1 BTW:
-    # ------------------------------------------------------------------------------------------------------------------
     print("\n" + "=" * 80)
     print("PHASE 1: CLASSIFIER HEAD TRAINING (FROZEN BACKBONE)")
     print("=" * 80)
-    print(f"Epochs: {Config.PHASE1_EPOCHS} | LR: {Config.PHASE1_LR}")
+    print(f"Epochs: {Config.PHASE1_EPOCHS} | LR: {Config.PHASE1_LR} | Batch: {Config.BATCH_SIZE}")
     print("=" * 80)
 
     model.freeze_backbone(freeze = True)
@@ -329,7 +302,7 @@ def train_model():
     start_time = time.time()
 
     for epoch in range(1, Config.PHASE1_EPOCHS + 1):
-        train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device, scaler, epoch, 'Phase1')
+        train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device, scaler, None, epoch, 'Phase1')
         val_metrics = evaluate(model, val_loader, criterion, device, 'Val')
         val_loss, val_acc = val_metrics['loss'], val_metrics['accuracy']
         scheduler.step()
@@ -362,14 +335,12 @@ def train_model():
     print(f"\n✓ Phase 1 complete in {phase1_time / 60:.1f} minutes")
     print(f"  Best Val Acc: {best_val_acc:.4f}")
 
-    # ------------------------------------------------------------------------------------------------------------------
-    # PHASE 2: FINE TUNE STUFF PHASE 2 UNFROZEN BTW:
-    # Super similar to phase 1.
-    # ------------------------------------------------------------------------------------------------------------------
     print("\n" + "=" * 80)
     print("PHASE 2: FULL MODEL FINE-TUNING (UNFROZEN BACKBONE)")
     print("=" * 80)
-    print(f"Epochs: {Config.PHASE2_EPOCHS} | LR: {Config.PHASE2_LR}")
+    print(f"Epochs: {Config.PHASE2_EPOCHS} | LR: {Config.PHASE2_LR} | Batch: {Config.BATCH_SIZE}")
+    if Config.USE_ONECYCLE:
+        print("✓ Using OneCycleLR for faster convergence")
     print("=" * 80)
 
     checkpoint = torch.load(Config.CHECKPOINT_DIR / 'best_model_phase1.pth')
@@ -378,16 +349,34 @@ def train_model():
 
     model.freeze_backbone(freeze = False)
     optimizer = optim.AdamW(model.parameters(), lr = Config.PHASE2_LR, weight_decay = Config.WEIGHT_DECAY)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max = Config.PHASE2_EPOCHS, eta_min = 1e-7)
+    
+    if Config.USE_ONECYCLE:
+        steps_per_epoch = len(train_loader)
+        scheduler = optim.lr_scheduler.OneCycleLR(
+            optimizer, 
+            max_lr = Config.PHASE2_LR * 3,
+            epochs = Config.PHASE2_EPOCHS,
+            steps_per_epoch = steps_per_epoch,
+            pct_start = 0.3,
+            anneal_strategy = 'cos',
+            div_factor = 10.0,
+            final_div_factor = 100.0
+        )
+    else:
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max = Config.PHASE2_EPOCHS, eta_min = 1e-7)
+    
     best_val_acc = checkpoint['val_acc']
     patience_counter = 0
     start_time = time.time()
 
     for epoch in range(1, Config.PHASE2_EPOCHS + 1):
-        train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device, scaler, epoch, 'Phase2')
+        train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device, scaler, scheduler, epoch, 'Phase2')
         val_metrics = evaluate(model, val_loader, criterion, device, 'Val')
         val_loss, val_acc = val_metrics['loss'], val_metrics['accuracy']
-        scheduler.step()
+        
+        if not Config.USE_ONECYCLE:
+            scheduler.step()
+        
         current_lr = optimizer.param_groups[0]['lr']
         tracker.update(train_loss, val_loss, train_acc, val_acc, val_metrics['recall'], current_lr)
 
@@ -402,7 +391,9 @@ def train_model():
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
-                'val_acc': val_acc
+                'val_acc': val_acc,
+                'val_probs': val_metrics['probabilities'],
+                'val_labels': val_metrics['labels']
             }, Config.CHECKPOINT_DIR / 'best_model_final.pth')
             print(f"  ✓ New best model saved! (Val Acc: {val_acc:.4f})")
             patience_counter = 0
@@ -417,18 +408,23 @@ def train_model():
     print(f"\n✓ Phase 2 complete in {phase2_time / 60:.1f} minutes")
     print(f"  Best Val Acc: {best_val_acc:.4f}")
 
-    # ------------------------------------------------------------------------------------------------------------------
     checkpoint = torch.load(Config.CHECKPOINT_DIR / 'best_model_final.pth')
     model.load_state_dict(checkpoint['model_state_dict'])
 
     optimal_threshold = 0.5
-    if Config.OPTIMIZE_THRESHOLD:
+    if Config.FAST_THRESHOLD:
         print("\n" + "=" * 80)
-        print("OPTIMIZING DECISION THRESHOLD")
+        print("OPTIMIZING DECISION THRESHOLD (FAST)")
         print("=" * 80)
-        optimal_threshold = find_optimal_threshold(model, val_loader, device, Config.TARGET_RECALL)
+        val_probs = np.array(checkpoint['val_probs'])
+        val_labels = np.array(checkpoint['val_labels'])
+        optimal_threshold = find_optimal_threshold_fast(val_probs, val_labels, Config.TARGET_RECALL)
+        final_recall = recall_score(val_labels, (val_probs >= optimal_threshold).astype(int))
+        final_acc = accuracy_score(val_labels, (val_probs >= optimal_threshold).astype(int))
+        print(f"Optimal threshold: {optimal_threshold:.3f}")
+        print(f"  Achieves recall: {final_recall:.3f}")
+        print(f"  With accuracy: {final_acc:.3f}")
 
-    # ------------------------------------------------------------------------------------------------------------------
     print("\n" + "=" * 80)
     print("FINAL EVALUATION ON TEST SET")
     print("=" * 80)
@@ -444,6 +440,10 @@ def train_model():
     print(f"  AUC:       {test_metrics['auc']:.4f}")
     print("=" * 80)
 
+    total_time = (phase1_time + phase2_time) / 60
+    print(f"\n⏱️  Total training time: {total_time:.1f} minutes")
+    print(f"   Phase 1: {phase1_time / 60:.1f} min | Phase 2: {phase2_time / 60:.1f} min")
+
     final_results = {
         'test_accuracy': float(test_metrics['accuracy']),
         'test_precision': float(test_metrics['precision']),
@@ -452,7 +452,8 @@ def train_model():
         'test_auc': float(test_metrics['auc']),
         'best_val_acc': float(best_val_acc),
         'optimal_threshold': float(optimal_threshold),
-        'total_training_time_minutes': float((phase1_time + phase2_time) / 60)
+        'total_training_time_minutes': float(total_time),
+        'total_epochs': len(tracker.train_losses)
     }
 
     with open(Config.OUTPUT_DIR / 'final_results.json', 'w') as f:
