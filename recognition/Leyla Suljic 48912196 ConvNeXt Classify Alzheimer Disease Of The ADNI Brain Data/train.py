@@ -1,8 +1,13 @@
+"""
+Training script for GFNet on ADNI Alzheimer's classification
+Optimized for achieving 80%+ accuracy
+"""
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.amp import autocast, GradScaler
-from torch.utils.data import WeightedRandomSampler
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, LinearLR, SequentialLR
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -10,502 +15,437 @@ from pathlib import Path
 from tqdm import tqdm
 import time
 import json
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, roc_auc_score, roc_curve
+from sklearn.metrics import (accuracy_score, precision_score, recall_score, 
+                            f1_score, confusion_matrix, roc_auc_score)
+
 from dataset import create_dataloaders
-from modules import create_alzheimer_model
-# ------------------------------------------------------------------------------------------------------------------
-# Preface: this code isn't all too exciting a lot of it does involve a lot of printing because I like being able to
-# see my metrics in a human readable format :3
-# ------------------------------------------------------------------------------------------------------------------
-class FocalLoss(nn.Module):
-    def __init__(self, alpha = 0.75, gamma = 2.0):
-        super(FocalLoss, self).__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-    
-    def forward(self, inputs, targets):
-        ce_loss = nn.functional.cross_entropy(inputs, targets, reduction = 'none')
-        pt = torch.exp(-ce_loss)
-        focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
-        return focal_loss.mean()
+from modules import create_gfnet_model
 
-# ------------------------------------------------------------------------------------------------------------------
+
+# ==================================================================================
+# CONFIGURATION
+# ==================================================================================
 class Config:
+    # Data
     DATA_ROOT = './data/ADNI/AD_NC'
-    BATCH_SIZE = 24
-    IMG_SIZE = 224
-    NUM_WORKERS = 8
-    MODEL_SIZE = 'base'
-    DROPOUT = 0.35
-
-    PHASE1_EPOCHS = 8
-    PHASE1_LR = 1.5e-3
     
-    PHASE2_EPOCHS = 20
-    PHASE2_LR = 2e-5
-    WEIGHT_DECAY = 1e-4
-    PATIENCE = 7
+    # Model
+    IMG_SIZE = 210
+    PATCH_SIZE = 14
+    EMBED_DIM = 384
+    DEPTH = 12
+    
+    # Training
+    BATCH_SIZE = 8
+    ACCUMULATION_STEPS = 8  # Effective batch size = 64
+    EPOCHS = 40
+    INITIAL_LR = 1e-3  # Reduced from 1e-3
+    WEIGHT_DECAY = 1e-3  # Increased from 5e-4
+    
+    
+    # Loss
+    LABEL_SMOOTHING = 0.1
+    
+    # Early stopping
+    PATIENCE = 20  # Reduced from 2000
     MIN_DELTA = 0.001
-    USE_MIXED_PRECISION = True
-    GRADIENT_CLIP = 1.0
-    LABEL_SMOOTHING = 0.05
-    CLASS_WEIGHTS = [0.4, 2.5]
     
-    USE_FOCAL_LOSS = True
-    FOCAL_ALPHA = 0.75
-    FOCAL_GAMMA = 2.0
-    USE_BALANCED_SAMPLING = True
-    USE_ONECYCLE = True
-    FAST_THRESHOLD = True
-    TARGET_RECALL = 0.85
+    # Learning rate scheduler (CosineAnnealingWarmRestarts)
+    LR_T0 = 10  # Initial restart period
+    LR_T_MULT = 2  # Multiply period by 2 after each restart
+    LR_ETA_MIN = 1e-7  # Minimum learning rate
 
-    OUTPUT_DIR = Path('./alzheimer_results')
+    # Other
+    NUM_WORKERS = 4
+    VAL_SPLIT = 0.1
+    USE_CLAHE = False  # Disabled to avoid distribution mismatch
+    
+    # Output
+    OUTPUT_DIR = Path('./gfnet_results')
     CHECKPOINT_DIR = OUTPUT_DIR / 'checkpoints'
     PLOTS_DIR = OUTPUT_DIR / 'plots'
+    
+    OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
+    CHECKPOINT_DIR.mkdir(exist_ok=True)
+    PLOTS_DIR.mkdir(exist_ok=True)
 
-    OUTPUT_DIR.mkdir(exist_ok = True, parents = True)
-    CHECKPOINT_DIR.mkdir(exist_ok = True)
-    PLOTS_DIR.mkdir(exist_ok = True)
 
-# ------------------------------------------------------------------------------------------------------------------
-class MetricsTracker:
-    def __init__(self):
-        self.train_losses = []
-        self.val_losses = []
-        self.train_accs = []
-        self.val_accs = []
-        self.val_recalls = []
-        self.learning_rates = []
-        self.best_val_acc = 0.0
-        self.best_epoch = 0
-
-    def update(self, train_loss, val_loss, train_acc, val_acc, val_recall, lr):
-        self.train_losses.append(train_loss)
-        self.val_losses.append(val_loss)
-        self.train_accs.append(train_acc)
-        self.val_accs.append(val_acc)
-        self.val_recalls.append(val_recall)
-        self.learning_rates.append(lr)
-
-        if val_acc > self.best_val_acc:
-            self.best_val_acc = val_acc
-            self.best_epoch = len(self.val_accs) - 1
-
-    def plot(self, save_path):
-        fig, axes = plt.subplots(2, 2, figsize = (15, 10))
-        epochs = range(1, len(self.train_losses) + 1)
-
-        axes[0, 0].plot(epochs, self.train_losses, 'b-', label = 'Train Loss', linewidth = 2)
-        axes[0, 0].plot(epochs, self.val_losses, 'r-', label = 'Val Loss', linewidth = 2)
-        axes[0, 0].axvline(self.best_epoch + 1, color = 'g', linestyle = '--', alpha = 0.5, label = f'Best Epoch ({self.best_epoch + 1})')
-        axes[0, 0].set_xlabel('Epoch', fontsize = 12)
-        axes[0, 0].set_ylabel('Loss', fontsize = 12)
-        axes[0, 0].set_title('Training & Validation Loss', fontsize = 14, fontweight = 'bold')
-        axes[0, 0].legend()
-        axes[0, 0].grid(True, alpha = 0.3)
-
-        axes[0, 1].plot(epochs, self.train_accs, 'b-', label = 'Train Acc', linewidth = 2)
-        axes[0, 1].plot(epochs, self.val_accs, 'r-', label = 'Val Acc', linewidth = 2)
-        axes[0, 1].axvline(self.best_epoch + 1, color = 'g', linestyle = '--', alpha = 0.5, label = f'Best Epoch ({self.best_epoch + 1})')
-        axes[0, 1].axhline(0.8, color = 'orange', linestyle = '--', alpha = 0.5, label = 'Target (0.8)')
-        axes[0, 1].axhline(0.85, color = 'purple', linestyle = '--', alpha = 0.5, label = 'Goal (0.85)')
-        axes[0, 1].set_xlabel('Epoch', fontsize = 12)
-        axes[0, 1].set_ylabel('Accuracy', fontsize = 12)
-        axes[0, 1].set_title('Training & Validation Accuracy', fontsize = 14, fontweight = 'bold')
-        axes[0, 1].legend()
-        axes[0, 1].grid(True, alpha = 0.3)
-
-        axes[1, 0].plot(epochs, self.val_recalls, 'purple', linewidth = 2, label = 'Val Recall')
-        axes[1, 0].axhline(0.85, color = 'orange', linestyle = '--', alpha = 0.5, label = 'Target (0.85)')
-        axes[1, 0].set_xlabel('Epoch', fontsize = 12)
-        axes[1, 0].set_ylabel('Recall (AD Detection)', fontsize = 12)
-        axes[1, 0].set_title('AD Detection Rate', fontsize = 14, fontweight = 'bold')
-        axes[1, 0].legend()
-        axes[1, 0].grid(True, alpha = 0.3)
-
-        summary_text = f"""
-            Best Validation Accuracy: {self.best_val_acc:.4f}
-            Best Epoch: {self.best_epoch + 1}
-            Final Train Acc: {self.train_accs[-1]:.4f}
-            Final Val Acc: {self.val_accs[-1]:.4f}
-            Final Val Recall: {self.val_recalls[-1]:.4f}
-            Final Train Loss: {self.train_losses[-1]:.4f}
-            Final Val Loss: {self.val_losses[-1]:.4f}
-            Total Epochs: {len(self.train_losses)}
-            Target Achieved: {'✓ YES' if self.best_val_acc >= 0.8 else '✗ NO'}
-        """
-        axes[1, 1].axis('off')
-        axes[1, 1].text(0.1, 0.5, summary_text, fontsize = 11, verticalalignment = 'center', fontfamily = 'monospace', bbox = dict(boxstyle = 'round', facecolor = 'wheat', alpha = 0.3))
-        plt.tight_layout()
-        plt.savefig(save_path, dpi = 300, bbox_inches = 'tight')
-        plt.close()
-
-# ------------------------------------------------------------------------------------------------------------------
-def create_balanced_sampler(dataset):
-    labels = [label for _, label in dataset]
-    class_counts = np.bincount(labels)
-    class_weights = 1.0 / class_counts
-    sample_weights = [class_weights[label] for label in labels]
-    return WeightedRandomSampler(weights = sample_weights, num_samples = len(sample_weights), replacement = True)
-
-# ------------------------------------------------------------------------------------------------------------------
-def train_one_epoch(model, dataloader, criterion, optimizer, device, scaler = None, scheduler = None, epoch = 1, phase = 'Phase1'):
+# ==================================================================================
+# TRAINING FUNCTIONS
+# ==================================================================================
+def train_one_epoch(model, dataloader, criterion, optimizer, device, scaler, epoch, accumulation_steps=1):
+    """Train for one epoch with gradient accumulation"""
     model.train()
-    running_loss = 0.0
-    all_preds = []
-    all_labels = []
-    pbar = tqdm(dataloader, desc = f'{phase} Epoch {epoch} [TRAIN]')
+    total_loss = 0
+    correct = 0
+    total = 0
 
-    for images, labels in pbar:
-        images = images.to(device, non_blocking = True)
-        labels = labels.to(device, non_blocking = True)
-        optimizer.zero_grad(set_to_none = True)
+    # Track per-class metrics
+    class_correct = [0, 0]
+    class_total = [0, 0]
 
-        if scaler is not None:
-            with autocast(device_type = 'cuda'):
-                outputs = model(images)
-                loss = criterion(outputs, labels)
+    optimizer.zero_grad()  # Zero gradients at start
 
-            scaler.scale(loss).backward()
+    pbar = tqdm(dataloader, desc=f'Epoch {epoch} [Train]')
+    for batch_idx, (images, labels) in enumerate(pbar):
+        images, labels = images.to(device), labels.to(device)
+
+        # Mixed precision training
+        with autocast(device_type=device.type):
+            outputs = model(images)
+            loss = criterion(outputs, labels) / accumulation_steps  # Scale loss
+
+        # Backward pass (accumulate gradients)
+        scaler.scale(loss).backward()
+
+        # Gradient accumulation: only step optimizer every N batches
+        if (batch_idx + 1) % accumulation_steps == 0:
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), Config.GRADIENT_CLIP)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)  # Reduced from 1.0
             scaler.step(optimizer)
             scaler.update()
+            optimizer.zero_grad()
 
-        else:
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), Config.GRADIENT_CLIP)
-            optimizer.step()
+        # Metrics (accumulate over all batches, not just accumulation steps)
+        total_loss += loss.item() * accumulation_steps  # Rescale for proper averaging
+        _, predicted = torch.max(outputs.data, 1)
+        total += labels.size(0)
+        correct += (predicted == labels).sum().item()
 
-        if scheduler is not None and Config.USE_ONECYCLE:
-            scheduler.step()
+        # Per-class accuracy
+        for i in range(2):
+            mask = (labels == i)
+            class_total[i] += mask.sum().item()
+            class_correct[i] += ((predicted == labels) & mask).sum().item()
 
-        running_loss += loss.item() * images.size(0)
-        preds = torch.argmax(outputs, dim = 1)
-        all_preds.extend(preds.cpu().numpy())
-        all_labels.extend(labels.cpu().numpy())
-        pbar.set_postfix({'loss': loss.item()})
+        # Progress bar
+        current_lr = optimizer.param_groups[0]['lr']
+        pbar.set_postfix({
+            'loss': f'{loss.item()*accumulation_steps:.4f}',
+            'acc': f'{100.*correct/total:.2f}%',
+            'lr': f'{current_lr:.6f}'
+        })
 
-    epoch_loss = running_loss / len(dataloader.dataset)
-    epoch_acc = accuracy_score(all_labels, all_preds)
+    epoch_loss = total_loss / len(dataloader)
+    epoch_acc = correct / total
+
     return epoch_loss, epoch_acc
 
-# ------------------------------------------------------------------------------------------------------------------
-def evaluate(model, dataloader, criterion, device, split = 'Val', threshold = 0.5):
+
+@torch.no_grad()
+def evaluate(model, dataloader, criterion, device):
+    """Evaluate model"""
     model.eval()
-    running_loss = 0.0
+    total_loss = 0
     all_preds = []
     all_labels = []
     all_probs = []
-
-    with torch.no_grad():
-        for images, labels in tqdm(dataloader, desc = f'[{split}]', leave = False):
-            images = images.to(device, non_blocking = True)
-            labels = labels.to(device, non_blocking = True)
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-            running_loss += loss.item() * images.size(0)
-            probs = torch.softmax(outputs, dim = 1)[:, 1]
-            preds = (probs >= threshold).long()
-            all_probs.extend(probs.cpu().numpy())
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
-
-    epoch_loss = running_loss / len(dataloader.dataset)
+    
+    for images, labels in tqdm(dataloader, desc='Evaluating', leave=False):
+        images, labels = images.to(device), labels.to(device)
+        
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+        
+        total_loss += loss.item()
+        
+        probs = torch.softmax(outputs, dim=1)
+        preds = torch.argmax(probs, dim=1)
+        
+        all_preds.extend(preds.cpu().numpy())
+        all_labels.extend(labels.cpu().numpy())
+        all_probs.extend(probs[:, 1].cpu().numpy())
+    
+    # Calculate metrics
     metrics = {
-        'loss': epoch_loss,
+        'loss': total_loss / len(dataloader),
         'accuracy': accuracy_score(all_labels, all_preds),
-        'precision': precision_score(all_labels, all_preds, zero_division = 0),
-        'recall': recall_score(all_labels, all_preds, zero_division = 0),
-        'f1': f1_score(all_labels, all_preds, zero_division = 0),
-        'auc': roc_auc_score(all_labels, all_probs) if len(np.unique(all_labels)) > 1 else 0.0,
-        'predictions': all_preds,
-        'labels': all_labels,
-        'probabilities': all_probs
+        'precision': precision_score(all_labels, all_preds, zero_division=0),
+        'recall': recall_score(all_labels, all_preds, zero_division=0),
+        'f1': f1_score(all_labels, all_preds, zero_division=0),
+        'auc': roc_auc_score(all_labels, all_probs) if len(np.unique(all_labels)) > 1 else 0,
+        'predictions': np.array(all_preds),
+        'labels': np.array(all_labels)
     }
+    
     return metrics
 
-# ------------------------------------------------------------------------------------------------------------------
-def find_optimal_threshold_fast(all_probs, all_labels, target_recall = 0.85):
-    best_threshold = 0.5
-    best_acc = 0.0
-    for threshold in np.arange(0.35, 0.60, 0.02):
-        preds = (all_probs >= threshold).astype(int)
-        recall = recall_score(all_labels, preds, zero_division = 0)
-        if recall >= target_recall:
-            acc = accuracy_score(all_labels, preds)
-            if acc > best_acc:
-                best_acc = acc
-                best_threshold = threshold
-    return best_threshold
 
-# ------------------------------------------------------------------------------------------------------------------
+def plot_training_history(history, save_path):
+    """Plot training curves"""
+    fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+    
+    epochs = range(1, len(history['train_loss']) + 1)
+    
+    # Loss
+    axes[0, 0].plot(epochs, history['train_loss'], 'b-', label='Train Loss', linewidth=2)
+    axes[0, 0].plot(epochs, history['val_loss'], 'r-', label='Val Loss', linewidth=2)
+    axes[0, 0].set_xlabel('Epoch', fontsize=12)
+    axes[0, 0].set_ylabel('Loss', fontsize=12)
+    axes[0, 0].set_title('Training and Validation Loss', fontsize=14, fontweight='bold')
+    axes[0, 0].legend()
+    axes[0, 0].grid(True, alpha=0.3)
+    
+    # Accuracy
+    axes[0, 1].plot(epochs, history['train_acc'], 'b-', label='Train Acc', linewidth=2)
+    axes[0, 1].plot(epochs, history['val_acc'], 'r-', label='Val Acc', linewidth=2)
+    axes[0, 1].axhline(y=0.8, color='g', linestyle='--', label='Target (80%)', linewidth=2)
+    axes[0, 1].set_xlabel('Epoch', fontsize=12)
+    axes[0, 1].set_ylabel('Accuracy', fontsize=12)
+    axes[0, 1].set_title('Training and Validation Accuracy', fontsize=14, fontweight='bold')
+    axes[0, 1].legend()
+    axes[0, 1].grid(True, alpha=0.3)
+    
+    # Recall
+    axes[1, 0].plot(epochs, history['val_recall'], 'purple', linewidth=2, marker='o')
+    axes[1, 0].axhline(y=0.7, color='g', linestyle='--', label='Target (70%)', linewidth=2)
+    axes[1, 0].set_xlabel('Epoch', fontsize=12)
+    axes[1, 0].set_ylabel('Recall', fontsize=12)
+    axes[1, 0].set_title('Validation Recall (AD Class)', fontsize=14, fontweight='bold')
+    axes[1, 0].legend()
+    axes[1, 0].grid(True, alpha=0.3)
+    
+    # F1 Score
+    axes[1, 1].plot(epochs, history['val_f1'], 'orange', linewidth=2, marker='s')
+    axes[1, 1].set_xlabel('Epoch', fontsize=12)
+    axes[1, 1].set_ylabel('F1 Score', fontsize=12)
+    axes[1, 1].set_title('Validation F1 Score', fontsize=14, fontweight='bold')
+    axes[1, 1].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+def plot_confusion_matrix(y_true, y_pred, save_path):
+    """Plot confusion matrix"""
+    cm = confusion_matrix(y_true, y_pred)
+    cm_percent = cm.astype('float') / (cm.sum(axis=1)[:, np.newaxis] + 1e-6) * 100
+    
+    plt.figure(figsize=(10, 8))
+    
+    labels = np.array([[f"{cm[i,j]}\n({cm_percent[i,j]:.1f}%)"
+                       for j in range(2)] for i in range(2)])
+    
+    sns.heatmap(cm, annot=labels, fmt='', cmap='Blues',
+                xticklabels=['Predicted: NC', 'Predicted: AD'],
+                yticklabels=['True: NC', 'True: AD'],
+                linewidths=2, linecolor='black',
+                annot_kws={'fontsize': 14, 'fontweight': 'bold'})
+    
+    plt.title('Confusion Matrix', fontsize=16, fontweight='bold')
+    plt.ylabel('True Label', fontsize=14)
+    plt.xlabel('Predicted Label', fontsize=14)
+    
+    # Add metrics
+    tn, fp, fn, tp = cm.ravel()
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+    
+    textstr = f'AD Recall: {recall:.3f}\nAD Precision: {precision:.3f}'
+    props = dict(boxstyle='round', facecolor='wheat', alpha=0.9)
+    plt.text(1.3, 0.5, textstr, transform=plt.gca().transAxes,
+            fontsize=12, verticalalignment='center', bbox=props)
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+# ==================================================================================
+# MAIN TRAINING LOOP
+# ==================================================================================
 def train_model():
-    print("=" * 80)
-    print("FAST OPTIMIZED ALZHEIMER'S CLASSIFICATION")
-    print("TARGET: 85%+ ACCURACY IN ~30 MINUTES!")
-    print("=" * 80)
-
+    """Main training function"""
+    print("\n" + "="*80)
+    print("GFNET TRAINING FOR ALZHEIMER'S DISEASE CLASSIFICATION")
+    print("Target: 80%+ Accuracy")
+    print("="*80)
+    
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Device: {device}")
-    if device.type == 'cuda':
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
-        torch.backends.cudnn.benchmark = True
-
-    print(f"\nLoading data from {Config.DATA_ROOT}")
+    print(f"\n🖥️ Device: {device}")
+    if torch.cuda.is_available():
+        print(f"🎮 GPU: {torch.cuda.get_device_name(0)}")
+    
+    # Load data
     train_loader, val_loader, test_loader = create_dataloaders(
-        data_root = Config.DATA_ROOT,
-        batch_size = Config.BATCH_SIZE,
-        img_size = Config.IMG_SIZE,
-        num_workers = Config.NUM_WORKERS
+        Config.DATA_ROOT,
+        batch_size=Config.BATCH_SIZE,
+        img_size=Config.IMG_SIZE,
+        num_workers=Config.NUM_WORKERS,
+        val_split=Config.VAL_SPLIT,
+        use_clahe=Config.USE_CLAHE
+    )
+    
+    # Create model
+    model = create_gfnet_model(
+        img_size=Config.IMG_SIZE,
+        patch_size=Config.PATCH_SIZE,
+        in_chans=1,
+        num_classes=2,
+        embed_dim=Config.EMBED_DIM,
+        depth=Config.DEPTH,
+        drop_rate=0.2,  # Increased from 0.1 for regularization
+        drop_path_rate=0.2  # Increased from 0.1 for regularization
+    ).to(device)
+    
+    # Loss and optimizer
+    criterion = nn.CrossEntropyLoss(label_smoothing=Config.LABEL_SMOOTHING)
+    optimizer = optim.AdamW(model.parameters(),
+                           lr=Config.INITIAL_LR,
+                           weight_decay=Config.WEIGHT_DECAY)
+
+    # Learning rate scheduler - Warmup + CosineAnnealingWarmRestarts
+    warmup_scheduler = LinearLR(
+        optimizer,
+        start_factor=0.1,
+        end_factor=1.0,
+        total_iters=5  # 5 epoch warmup
     )
 
-    if Config.USE_BALANCED_SAMPLING:
-        print("✓ Using class-balanced sampling")
-        train_sampler = create_balanced_sampler(train_loader.dataset)
-        train_loader = torch.utils.data.DataLoader(
-            train_loader.dataset,
-            batch_size = Config.BATCH_SIZE,
-            sampler = train_sampler,
-            num_workers = Config.NUM_WORKERS
-        )
+    main_scheduler = CosineAnnealingWarmRestarts(
+        optimizer,
+        T_0=Config.LR_T0,
+        T_mult=Config.LR_T_MULT,
+        eta_min=Config.LR_ETA_MIN
+    )
 
-    print(f"Train: {len(train_loader.dataset)} | Val: {len(val_loader.dataset)} | Test: {len(test_loader.dataset)}")
+    scheduler = SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, main_scheduler],
+        milestones=[5]  # Switch from warmup to main scheduler after 5 epochs
+    )
 
-    print("\nBuilding model...")
-    model = create_alzheimer_model(model_size = Config.MODEL_SIZE, dropout = Config.DROPOUT, device = device)
-    print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
-
-    if Config.USE_FOCAL_LOSS:
-        print(f"✓ Using Focal Loss (alpha = {Config.FOCAL_ALPHA}, gamma = {Config.FOCAL_GAMMA})")
-        criterion = FocalLoss(alpha = Config.FOCAL_ALPHA, gamma = Config.FOCAL_GAMMA)
-    else:
-        class_weights = torch.FloatTensor(Config.CLASS_WEIGHTS).to(device)
-        criterion = nn.CrossEntropyLoss(weight = class_weights, label_smoothing = Config.LABEL_SMOOTHING)
-
-    scaler = GradScaler() if Config.USE_MIXED_PRECISION and device.type == 'cuda' else None
-    tracker = MetricsTracker()
-
-    print("\n" + "=" * 80)
-    print("PHASE 1: CLASSIFIER HEAD TRAINING (FROZEN BACKBONE)")
-    print("=" * 80)
-    print(f"Epochs: {Config.PHASE1_EPOCHS} | LR: {Config.PHASE1_LR} | Batch: {Config.BATCH_SIZE}")
-    print("=" * 80)
-
-    model.freeze_backbone(freeze = True)
-    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr = Config.PHASE1_LR, weight_decay = Config.WEIGHT_DECAY)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max = Config.PHASE1_EPOCHS, eta_min = 1e-6)
-    best_val_acc = 0.0
+    
+    # Mixed precision
+    scaler = GradScaler()
+    
+    # Training history
+    history = {
+        'train_loss': [], 'train_acc': [],
+        'val_loss': [], 'val_acc': [], 
+        'val_recall': [], 'val_f1': []
+    }
+    
+    best_val_acc = 0
     patience_counter = 0
     start_time = time.time()
+    
+    print("\n" + "="*80)
+    print("STARTING TRAINING")
+    print("="*80)
+    
+    for epoch in range(1, Config.EPOCHS + 1):
+        # Train
+        train_loss, train_acc = train_one_epoch(
+            model, train_loader, criterion, optimizer, device, scaler, epoch, Config.ACCUMULATION_STEPS
+        )
+        
+        # Validate
+        val_metrics = evaluate(model, val_loader, criterion, device)
 
-    for epoch in range(1, Config.PHASE1_EPOCHS + 1):
-        train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device, scaler, None, epoch, 'Phase1')
-        val_metrics = evaluate(model, val_loader, criterion, device, 'Val')
-        val_loss, val_acc = val_metrics['loss'], val_metrics['accuracy']
+        # Update scheduler
         scheduler.step()
-        current_lr = optimizer.param_groups[0]['lr']
-        tracker.update(train_loss, val_loss, train_acc, val_acc, val_metrics['recall'], current_lr)
+        
+        # Update history
+        history['train_loss'].append(train_loss)
+        history['train_acc'].append(train_acc)
+        history['val_loss'].append(val_metrics['loss'])
+        history['val_acc'].append(val_metrics['accuracy'])
+        history['val_recall'].append(val_metrics['recall'])
+        history['val_f1'].append(val_metrics['f1'])
+        
+        # Print progress
+        current_lr = scheduler.get_last_lr()[0] if hasattr(scheduler, 'get_last_lr') else optimizer.param_groups[0]['lr']
+        print(f"\n📊 Epoch {epoch}/{Config.EPOCHS} (LR: {current_lr:.6f}):")
+        print(f"   Train: Loss={train_loss:.4f}, Acc={train_acc:.4f}")
+        print(f"   Val:   Loss={val_metrics['loss']:.4f}, Acc={val_metrics['accuracy']:.4f}")
+        print(f"   📌 Recall={val_metrics['recall']:.4f}, F1={val_metrics['f1']:.4f}")
+        
+        # Save best model
+        if val_metrics['accuracy'] > best_val_acc:
+            best_val_acc = val_metrics['accuracy']
+            print(f"   ✅ New best validation accuracy! Saving model...")
 
-        print(f"\nEpoch {epoch}/{Config.PHASE1_EPOCHS}:")
-        print(f"  Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f}")
-        print(f"  Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
-        print(f"  Precision: {val_metrics['precision']:.4f} | Recall: {val_metrics['recall']:.4f} | F1: {val_metrics['f1']:.4f}")
-        print(f"  LR: {current_lr:.2e}")
-
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
-                'val_acc': val_acc
-            }, Config.CHECKPOINT_DIR / 'best_model_phase1.pth')
-            print(f"  ✓ New best model saved! (Val Acc: {val_acc:.4f})")
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_acc': val_metrics['accuracy'],
+                'val_recall': val_metrics['recall']
+            }, Config.CHECKPOINT_DIR / 'best_model.pth')
+
             patience_counter = 0
         else:
             patience_counter += 1
-
-        if patience_counter >= Config.PATIENCE:
-            print(f"\n⚠ Early stopping triggered after {epoch} epochs")
-            break
-
-    phase1_time = time.time() - start_time
-    print(f"\n✓ Phase 1 complete in {phase1_time / 60:.1f} minutes")
-    print(f"  Best Val Acc: {best_val_acc:.4f}")
-
-    print("\n" + "=" * 80)
-    print("PHASE 2: FULL MODEL FINE-TUNING (UNFROZEN BACKBONE)")
-    print("=" * 80)
-    print(f"Epochs: {Config.PHASE2_EPOCHS} | LR: {Config.PHASE2_LR} | Batch: {Config.BATCH_SIZE}")
-    if Config.USE_ONECYCLE:
-        print("✓ Using OneCycleLR for faster convergence")
-    print("=" * 80)
-
-    checkpoint = torch.load(Config.CHECKPOINT_DIR / 'best_model_phase1.pth')
-    model.load_state_dict(checkpoint['model_state_dict'])
-    print(f"✓ Loaded best Phase 1 model (Val Acc: {checkpoint['val_acc']:.4f})")
-
-    model.freeze_backbone(freeze = False)
-    optimizer = optim.AdamW(model.parameters(), lr = Config.PHASE2_LR, weight_decay = Config.WEIGHT_DECAY)
-    
-    if Config.USE_ONECYCLE:
-        steps_per_epoch = len(train_loader)
-        scheduler = optim.lr_scheduler.OneCycleLR(
-            optimizer, 
-            max_lr = Config.PHASE2_LR * 3,
-            epochs = Config.PHASE2_EPOCHS,
-            steps_per_epoch = steps_per_epoch,
-            pct_start = 0.3,
-            anneal_strategy = 'cos',
-            div_factor = 10.0,
-            final_div_factor = 100.0
-        )
-    else:
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max = Config.PHASE2_EPOCHS, eta_min = 1e-7)
-    
-    best_val_acc = checkpoint['val_acc']
-    patience_counter = 0
-    start_time = time.time()
-
-    for epoch in range(1, Config.PHASE2_EPOCHS + 1):
-        train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device, scaler, scheduler, epoch, 'Phase2')
-        val_metrics = evaluate(model, val_loader, criterion, device, 'Val')
-        val_loss, val_acc = val_metrics['loss'], val_metrics['accuracy']
         
-        if not Config.USE_ONECYCLE:
-            scheduler.step()
-        
-        current_lr = optimizer.param_groups[0]['lr']
-        tracker.update(train_loss, val_loss, train_acc, val_acc, val_metrics['recall'], current_lr)
-
-        print(f"\nEpoch {epoch}/{Config.PHASE2_EPOCHS}:")
-        print(f"  Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f}")
-        print(f"  Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
-        print(f"  Precision: {val_metrics['precision']:.4f} | Recall: {val_metrics['recall']:.4f} | F1: {val_metrics['f1']:.4f}")
-        print(f"  LR: {current_lr:.2e}")
-
-        if val_acc > best_val_acc + Config.MIN_DELTA:
-            best_val_acc = val_acc
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'val_acc': val_acc,
-                'val_probs': val_metrics['probabilities'],
-                'val_labels': val_metrics['labels']
-            }, Config.CHECKPOINT_DIR / 'best_model_final.pth')
-            print(f"  ✓ New best model saved! (Val Acc: {val_acc:.4f})")
-            patience_counter = 0
-        else:
-            patience_counter += 1
-
+        # Early stopping
         if patience_counter >= Config.PATIENCE:
-            print(f"\n⚠ Early stopping triggered after {epoch} epochs")
+            print(f"\n⚠️ Early stopping at epoch {epoch}")
             break
-
-    phase2_time = time.time() - start_time
-    print(f"\n✓ Phase 2 complete in {phase2_time / 60:.1f} minutes")
-    print(f"  Best Val Acc: {best_val_acc:.4f}")
-
-    checkpoint = torch.load(Config.CHECKPOINT_DIR / 'best_model_final.pth')
+    
+    training_time = time.time() - start_time
+    print(f"\n⏱️ Training completed in {training_time/60:.1f} minutes")
+    
+    # Plot training history
+    plot_training_history(history, Config.PLOTS_DIR / 'training_history.png')
+    print(f"📊 Training plots saved")
+    
+    # ==================================================================================
+    # TEST EVALUATION
+    # ==================================================================================
+    print("\n" + "="*80)
+    print("FINAL TEST EVALUATION")
+    print("="*80)
+    
+    # Load best model
+    checkpoint = torch.load(Config.CHECKPOINT_DIR / 'best_model.pth')
     model.load_state_dict(checkpoint['model_state_dict'])
-
-    optimal_threshold = 0.5
-    if Config.FAST_THRESHOLD:
-        print("\n" + "=" * 80)
-        print("OPTIMIZING DECISION THRESHOLD (FAST)")
-        print("=" * 80)
-        val_probs = np.array(checkpoint['val_probs'])
-        val_labels = np.array(checkpoint['val_labels'])
-        optimal_threshold = find_optimal_threshold_fast(val_probs, val_labels, Config.TARGET_RECALL)
-        final_recall = recall_score(val_labels, (val_probs >= optimal_threshold).astype(int))
-        final_acc = accuracy_score(val_labels, (val_probs >= optimal_threshold).astype(int))
-        print(f"Optimal threshold: {optimal_threshold:.3f}")
-        print(f"  Achieves recall: {final_recall:.3f}")
-        print(f"  With accuracy: {final_acc:.3f}")
-
-    print("\n" + "=" * 80)
-    print("FINAL EVALUATION ON TEST SET")
-    print("=" * 80)
-    print(f"✓ Using threshold: {optimal_threshold:.3f}")
-    test_metrics = evaluate(model, test_loader, criterion, device, 'Test', threshold = optimal_threshold)
-
-    print(f"\n🎯 TEST SET RESULTS:")
-    print("=" * 80)
-    print(f"  Accuracy:  {test_metrics['accuracy']:.4f} {'✓ TARGET ACHIEVED!' if test_metrics['accuracy'] >= 0.8 else '✗ Below target'}")
+    print(f"✅ Loaded best model from epoch {checkpoint['epoch']}")
+    
+    # Test
+    test_metrics = evaluate(model, test_loader, criterion, device)
+    
+    print("\n" + "="*80)
+    print("🎯 TEST RESULTS:")
+    print("="*80)
+    print(f"  Accuracy:  {test_metrics['accuracy']:.4f} ({test_metrics['accuracy']*100:.2f}%)")
     print(f"  Precision: {test_metrics['precision']:.4f}")
     print(f"  Recall:    {test_metrics['recall']:.4f}")
     print(f"  F1 Score:  {test_metrics['f1']:.4f}")
     print(f"  AUC:       {test_metrics['auc']:.4f}")
-    print("=" * 80)
-
-    total_time = (phase1_time + phase2_time) / 60
-    print(f"\n⏱️  Total training time: {total_time:.1f} minutes")
-    print(f"   Phase 1: {phase1_time / 60:.1f} min | Phase 2: {phase2_time / 60:.1f} min")
-
-    final_results = {
+    print("="*80)
+    
+    # Save results
+    results = {
         'test_accuracy': float(test_metrics['accuracy']),
         'test_precision': float(test_metrics['precision']),
         'test_recall': float(test_metrics['recall']),
         'test_f1': float(test_metrics['f1']),
         'test_auc': float(test_metrics['auc']),
-        'best_val_acc': float(best_val_acc),
-        'optimal_threshold': float(optimal_threshold),
-        'total_training_time_minutes': float(total_time),
-        'total_epochs': len(tracker.train_losses)
+        'training_time_minutes': training_time / 60,
+        'epochs_trained': len(history['train_loss'])
     }
-
-    with open(Config.OUTPUT_DIR / 'final_results.json', 'w') as f:
-        json.dump(final_results, f, indent = 4)
-
-    tracker.plot(Config.PLOTS_DIR / 'training_curves.png')
-
+    
+    with open(Config.OUTPUT_DIR / 'results.json', 'w') as f:
+        json.dump(results, f, indent=4)
+    
+    # Plot confusion matrix
     plot_confusion_matrix(
         test_metrics['labels'],
         test_metrics['predictions'],
         Config.PLOTS_DIR / 'confusion_matrix.png'
     )
+    
+    print(f"\n✅ All results saved to {Config.OUTPUT_DIR}")
+    
+    if test_metrics['accuracy'] >= 0.80:
+        print("\n" + "="*80)
+        print("🎉 SUCCESS! Achieved 80%+ accuracy! 🎉")
+        print("="*80)
+    
+    return test_metrics
 
-    plot_roc_curve(
-        test_metrics['labels'],
-        test_metrics['probabilities'],
-        Config.PLOTS_DIR / 'roc_curve.png'
-    )
 
-    print(f"\n✓ All results saved to {Config.OUTPUT_DIR}")
-    print("\n" + "=" * 80)
-    print("TRAINING COMPLETE! 🎉")
-    print("=" * 80)
-
-# ------------------------------------------------------------------------------------------------------------------
-def plot_confusion_matrix(y_true, y_pred, save_path):
-    cm = confusion_matrix(y_true, y_pred)
-    plt.figure(figsize = (8, 6))
-    sns.heatmap(cm, annot = True, fmt = 'd', cmap = 'Blues', cbar = True, xticklabels = ['Normal', 'AD'], yticklabels = ['Normal', 'AD'])
-    plt.xlabel('Predicted', fontsize = 12)
-    plt.ylabel('True', fontsize = 12)
-    plt.title('Confusion Matrix - Test Set', fontsize = 14, fontweight = 'bold')
-    plt.tight_layout()
-    plt.savefig(save_path, dpi = 300, bbox_inches = 'tight')
-    plt.close()
-
-# ------------------------------------------------------------------------------------------------------------------
-def plot_roc_curve(y_true, y_probs, save_path):
-    fpr, tpr, thresholds = roc_curve(y_true, y_probs)
-    auc = roc_auc_score(y_true, y_probs)
-    plt.figure(figsize = (8, 6))
-    plt.plot(fpr, tpr, 'b-', linewidth = 2, label = f'ROC Curve (AUC = {auc:.4f})')
-    plt.plot([0, 1], [0, 1], 'r--', linewidth = 2, label = 'Random Classifier')
-    plt.xlabel('False Positive Rate', fontsize = 12)
-    plt.ylabel('True Positive Rate', fontsize = 12)
-    plt.title('ROC Curve - Test Set', fontsize = 14, fontweight = 'bold')
-    plt.legend()
-    plt.grid(True, alpha = 0.3)
-    plt.tight_layout()
-    plt.savefig(save_path, dpi = 300, bbox_inches = 'tight')
-    plt.close()
-
-# ------------------------------------------------------------------------------------------------------------------
 if __name__ == '__main__':
     train_model()

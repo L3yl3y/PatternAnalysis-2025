@@ -100,12 +100,12 @@ FINAL TEST SET EVALUATION
                ↓
 ┌─────────────────────────────────────┐
 │   ConvNeXt Backbone (Pretrained)    │
-│   - Stem                             │
+│   - Stem                            │
 │   - Stage 0 (96 features)           │
 │   - Stage 1 (192 features)          │
 │   - Stage 2 (384 features)          │
 │   - Stage 3 (768 features)          │
-│   Output: [B, 1024, 7, 7]          │
+│   Output: [B, 1024, 7, 7]           │
 └──────────────┬──────────────────────┘
                ↓
         ┌──────┴──────┐
@@ -151,7 +151,7 @@ FINAL TEST SET EVALUATION
 ┌─────────────────────────────────────┐
 │   ConvNeXt Backbone (Pretrained)    │
 │   Same structure as before          │
-│   Output: [B, 1024, 7, 7]          │
+│   Output: [B, 1024, 7, 7]           │
 └──────────────┬──────────────────────┘
                ↓
       ┌────────┼────────┐
@@ -171,9 +171,9 @@ FINAL TEST SET EVALUATION
 │         │ │         │ │ ×Features    │
 │         │ │         │ │ Avg Pool     │
 └────┬────┘ └────┬────┘ └──────┬───────┘
-     │           │              │
-     │[B,1024]   │[B,1024]      │[B,1024]
-     └─────┬─────┴──────────┬───┘
+     │           │             │
+     │[B,1024]   │[B,1024]     │[B,1024]
+     └─────┬─────┴──────────┬──┘
            ↓                ↓
      ┌──────────────────────────┐
      │      Concatenate         │
@@ -236,3 +236,7 @@ Evaluating on Test Set with optimal threshold...
    Phase 1: 14.2 min (12 epochs) | Phase 2: 11.5 min (8 epochs)
    Total epochs run: 20
    Time per epoch: 77.2 seconds
+
+
+Run 7: trying to fix run 6 if i can:
+
