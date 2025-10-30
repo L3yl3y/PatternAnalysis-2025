@@ -4,7 +4,7 @@ Running these command:
     cd recognition/Leyla\ Suljic\ 48912196\ ConvNeXt\ Classify\ Alzheimer’s\ Disease\ Of\ The\ ADNI\ Brain\ Data\ /data
     scp -r s4891219@rangpur.compute.eait.uq.edu.au:/home/groups/comp3710/ADNI .
 
----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+===================================================================================================================================================================================
 RUN 1: 
 ![alt text](image.png)
 
@@ -13,7 +13,7 @@ This is sort of a logic dump so on my very first implementation i seemed to get 
 Plus based on my results from analysis it seemed to be an issue where I was overpredicting the number of normals (referred to as a type 2 errors so lots of false negatives); I was over predicting the amount of normal MRI results despite the fact they were all AD. This was the overwhelming source of error in my implementation.
 
 My idea here is to increase the weighting for more significant focus on the AD (heavier penalty if i mistake the AD) and to have an increased no. of epochs as well as to increase my dropout (I am trying to fix my val accuracy vs test accuracy discrepancy).
----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+===================================================================================================================================================================================
 lOWKEY ALL THE training data is gaslightingb and lying to me it just does so shit on the final
 RUN 2:
 TEST SET RESULTS:
@@ -25,7 +25,7 @@ TEST SET RESULTS:
   Total training time: 44.4 minutes
   Phase 1: 9.4 min | Phase 2: 35.0 min
 
----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+===================================================================================================================================================================================
 Run 3:
 TEST SET RESULTS:
   Accuracy:  0.7516 ❌ Below target
@@ -40,8 +40,7 @@ TEST SET RESULTS:
 
   AGAIN the same issue here is the recall and overfitting where it will memorise training data and do really well there but when it comes to learning new datra it completely collapses herew sop the idea was now to change the weightings to more heavily penalise for an incorrect guessing as this will tailor the model to pay more attention to the AD cases, and I also have added an f2-score that is willing to sacrifice accuracy for the sake of a model that is more precise with finding the Ad cases in particular as that is our biggest cause for concern we seem to be missing up to 40% of the AD cases - classifying the sick as the healthy it is very concerneing. The numnber of epochs was increased to give the model a little more time to train as well as the learning rate decreases for a smoother more progressive appraoch to learning so it is not as unstable.
 
-  ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-
+===================================================================================================================================================================================
   Run 4:
   OPTIMIZING DECISION THRESHOLD (Targeting Recall >= 0.85
 
@@ -61,27 +60,19 @@ TEST SET RESULTS:
 
    so the new method recommended to me actually made it a lot worse lmao so it overfit pretty badly, the learning rate made itg more unstable and trhe focal loss alpha was too intense and the optimised f2-score and decreased the accuracy even further so let us bgin one more to get this right.
 
-    ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+===================================================================================================================================================================================
  Run 5:
-================================================================================
 OPTIMIZING THRESHOLD (Target Recall ~0.82)
-================================================================================
 ✓ Optimal threshold: 0.410
   Val metrics at threshold: Acc=0.9786, Recall=0.9929
 
-================================================================================
-FINAL TEST SET EVALUATION
-================================================================================
-
 🎯 TEST RESULTS:
-================================================================================
   Accuracy:  0.7806 ❌
   Recall:    0.6244 ❌  <-- KEY METRIC
   Precision: 0.9028
   F1 Score:  0.7382
   F2 Score:  0.6655
   AUC:       0.8710
-================================================================================
 
 ⏱️  Summary:
    Total time: 46.8 minutes
@@ -91,7 +82,7 @@ FINAL TEST SET EVALUATION
    Hopeful new improvemnets on my newest run after run 5: 
    # 🏗️ ARCHITECTURE COMPARISON
 
-### ❌ YOUR ORIGINAL ARCHITECTURE (2-Branch):
+My original 2 branch implementation:
 
 ```
 ┌─────────────────────────────────────┐
@@ -135,13 +126,7 @@ FINAL TEST SET EVALUATION
          [B, 2] Output
 ```
 
-**Features:** 2048 combined features
-**Capacity:** Limited spatial awareness
-
----
-
-### ✅ IMPROVED ARCHITECTURE (3-Branch + Feature Selection):
-
+improved 3 branch architecture suggestion:
 ```
 ┌─────────────────────────────────────┐
 │      Input Image (224×224×3)        │
@@ -200,15 +185,9 @@ FINAL TEST SET EVALUATION
              [B, 2] Output
 ```
 
-**Features:** 3072 combined features (50% increase!)
-**Capacity:** Spatial attention + feature importance gating
-**Preprocessing:** CLAHE for better contrast
-
-
+===================================================================================================================================================================================
 Run 6: Hopefully better with this triple architecture"
-================================================================================
-FINAL EVALUATION ON TEST SET
-================================================================================
+
 .\train.py:525: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will exec
 ute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This li
 mits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`.
@@ -222,14 +201,12 @@ Optimizing threshold based on best Validation F2-Score...
 Evaluating on Test Set with optimal threshold...
 
 🎯 TEST RESULTS:
-================================================================================
   Accuracy:  0.6676 ❌
   Recall:    0.8123 ✅  <-- KEY METRIC
   Precision: 0.6270
   F1 Score:  0.7078
   F2 Score:  0.7670  <-- OPTIMIZED FOR
   AUC:       0.7617
-================================================================================
 
 ⏱️  Summary:
    Total time: 25.7 minutes
@@ -237,6 +214,67 @@ Evaluating on Test Set with optimal threshold...
    Total epochs run: 20
    Time per epoch: 77.2 seconds
 
+===================================================================================================================================================================================
+Run 7: trying a new claude implementation with a bunch of suggestions based on what it did not like in my code:
+Here are improvements based on recent literature that supposedly will assist in a high accuracy:
+99.43% Accuracy - "A novel CNN architecture for accurate early detection" (El-Assy et al., 2024)
 
-Run 7: trying to fix run 6 if i can:
+Used dual CNN branches with concatenation
+Strong data augmentation
 
+
+98.57% Accuracy - "Deep Learning-Based Ensemble Method" (2024)
+
+Ensemble of 6 CNN models
+Slice-based approach with entropy selection
+
+
+96.5% Accuracy - "3D CNNs from intelligently selected neuroimaging" (2025)
+
+Used 3D convolutions
+Smart frame selection
+
+
+95.93% Accuracy - "Lightweight Deep Learning Model on MRI Data" (2023)
+
+Used attention mechanisms
+Proper preprocessing pipeline
+
+Why These Changes Work:
+Recent studies emphasize that combining attention mechanisms, proper preprocessing (your CLAHE is perfect!), and multi-branch architectures significantly improves AD detection FrontiersarXiv. The CLAHE preprocessing you're already using combined with proper augmentation and attention mechanisms has been shown to be particularly effective Nature.
+The key insight from the research is that models using multiple pooling strategies and attention mechanisms consistently achieve >90% accuracy Nature, which is why I've enhanced your 3-branch design to 4 branches with CBAM attention.
+
+
+🎯 TEST RESULTS:
+  Accuracy:  0.6612 ❌
+  Recall:    0.4141 ❌
+  Precision: 0.8090
+  F1 Score:  0.5478
+  F2 Score:  0.4589
+  AUC:       0.7763
+
+⏱️  Summary:
+   Total time: 13.8 minutes
+   Phase 1: 6.6 min | Phase 2: 7.3 min
+   Total epochs: 25
+
+================================================================================================================================================================
+
+Run 8: 
+  Accuracy:  0.6358 ⚠️
+  Precision: 0.7456
+  Recall:    0.4022
+  F1 Score:  0.5226
+  AUC:       0.7056
+  📊 Confusion matrix saved to alzheimer_results_98\plots\confusion_matrix.png
+
+  Run 9:
+🎯 Performance:
+   Accuracy:  0.7669 ❌
+   Recall:    0.6962 ❌
+   Precision: 0.8069
+   F1 Score:  0.7475
+   F2 Score:  0.7158
+   AUC:       0.8428
+   ⏱️  Total training time: 52.5 minutes
+================================================================================================================================================================
