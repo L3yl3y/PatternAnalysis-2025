@@ -82,47 +82,47 @@ def get_transforms(mode = 'train', img_size = 224):
             ),
 
             transforms.ColorJitter(
-                brightness=0.3,   # Increased from 0.2
-                contrast=0.3,     # Increased from 0.2
-                saturation=0.2,   # NEW: Add saturation variation
-                hue=0.05          # NEW: Tiny hue shift
+                brightness = 0.3,
+                contrast = 0.3,
+                saturation = 0.2,
+                hue = 0.05
             ),
 
-            transforms.RandomGrayscale(p=0.1),  # NEW: Sometimes convert to grayscale
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-            transforms.RandomErasing(  # NEW: Randomly erase patches (forces model to use multiple regions)
-                p=0.3, 
-                scale=(0.02, 0.1), 
-                ratio=(0.3, 3.3)
-            )
+            transforms.RandomGrayscale(p = 0.1), # Flip a coin to make the image black and white (0.1 chance).
+            transforms.ToTensor(), # From PIL image into PyTorch Tensor (numbers 0.0 to 1.0).
+            # Weird math step to orientate numbers more toward the centre.
+            transforms.Normalize(mean = [0.485, 0.456, 0.406], std = [0.229, 0.224, 0.225]),
+            transforms.RandomErasing( # Tough love where we will force the model to look at all parts of the brain.
+                p = 0.3, # By erasing specific parts of the brain it will force the model to look more.
+                scale = (0.02, 0.1), # Black box covering 2% to 5% of the image size.
+                ratio = (0.3, 3.3)
+            ) # Literally shove a box on a part of the brain.
         ])
     
-    else:  # val or test
+    else: # Validation testing so we don't want random testing while we are running the validation/test.
         return transforms.Compose([
-            transforms.Resize((img_size, img_size)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            transforms.Resize((img_size, img_size)), # Size to 224 x 224 as intended.
+            transforms.ToTensor(), # And bring values back to not being around 0 but back to their magic numbers.
+            transforms.Normalize(mean = [0.485, 0.456, 0.406], std = [0.229, 0.224, 0.225])
         ])
 
-# ------------------------------------------------------------------------------------------------------------------
-# DATALOADER - unchanged, this part was fine
-# ------------------------------------------------------------------------------------------------------------------
+"""Creates and returns the train, validation and test DataLoaders. This is what does the train/validation split btw."""
 def create_dataloaders(data_root, batch_size = 16, img_size = 224, num_workers = 8, val_split = 0.15):
     train_full = ADNIDataset(data_root, mode = 'train', transform = None, img_size = img_size)
-    test_dataset = ADNIDataset(data_root, mode = 'test', transform = get_transforms('test', img_size), img_size = img_size)
+    test_dataset = ADNIDataset(data_root, mode = 'test', transform = get_transforms('test', img_size),
+                               img_size = img_size) # Moved this off which pissed me off lmao.
     
-    train_paths = [sample[0] for sample in train_full.samples]
-    train_labels = [sample[1] for sample in train_full.samples]
+    train_paths = [sample[0] for sample in train_full.samples] # List of paths from full training set.
+    train_labels = [sample[1] for sample in train_full.samples] # All labels in list (0s and 1s).
     
-    train_paths, val_paths, train_labels, val_labels = train_test_split(
+    train_paths, val_paths, train_labels, val_labels = train_test_split( # Do the split; magic function scikit-learn.
         train_paths, train_labels,
         test_size = val_split,
-        stratify = train_labels,
-        random_state = 42
+        stratify = train_labels, # Must be same percentage of AD and NC pictures.
+        random_state = 42 # 42 will be the same each, and every time you run this code.
     )
     
-    # Train dataset with strong augmentation
+    # Train dataset with strong augmentation.
     train_dataset = ADNIDataset.__new__(ADNIDataset)
     train_dataset.__dict__.update({
         'data_root': Path(data_root),
@@ -141,13 +141,14 @@ def create_dataloaders(data_root, batch_size = 16, img_size = 224, num_workers =
         'img_size': img_size,
         'samples': list(zip(val_paths, val_labels))
     })
-    
+
+    # Pretty printing teehee so we can let the user know.
     print(f"\n📊 Dataset loaded:")
     print(f"   Train: {len(train_dataset)} samples")
     print(f"   Val:   {len(val_dataset)} samples")
     print(f"   Test:  {len(test_dataset)} samples")
     
-    # Create dataloaders
+    # Create dataloaders (Dataset holds the data whilst the DataLoader gets the data in batches).
     train_loader = DataLoader(
         train_dataset,
         batch_size = batch_size,
@@ -159,7 +160,7 @@ def create_dataloaders(data_root, batch_size = 16, img_size = 224, num_workers =
     val_loader = DataLoader(
         val_dataset,
         batch_size = batch_size,
-        shuffle = False,
+        shuffle = False, # No shuffle so we can actually test if our model is getting better.
         num_workers = num_workers,
         pin_memory = True
     )
@@ -172,4 +173,4 @@ def create_dataloaders(data_root, batch_size = 16, img_size = 224, num_workers =
         pin_memory = True
     )
     
-    return train_loader, val_loader, test_loader
+    return train_loader, val_loader, test_loader # 3 word data feeding machine.
