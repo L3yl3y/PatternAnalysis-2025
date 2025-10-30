@@ -278,3 +278,6 @@ Run 8:
    AUC:       0.8428
    ⏱️  Total training time: 52.5 minutes
 ================================================================================================================================================================
+
+Run 10 - 15: 
+I cannot for the life of me get it above 80% I literally do not understand ow to make this any better it is driving me insane.
