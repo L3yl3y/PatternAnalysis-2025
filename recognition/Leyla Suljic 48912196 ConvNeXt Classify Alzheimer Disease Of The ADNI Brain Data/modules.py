@@ -3,18 +3,18 @@ import torch.nn.functional as F
 from torchvision import models
 from torchvision.models import ConvNeXt_Tiny_Weights, ConvNeXt_Small_Weights, ConvNeXt_Base_Weights
 
-# ==================================================================================================================
+""" ==================================================================================================================
 # This model we were told to select is like the brain if you will so it's pretty smart and already has a lot of ...
 # pretrained images that allow it to be able to understand these brain images (like edges, shapes, textures etc).
 # So one thing that stands out about this is that it uses a two-phase training approach referred to as ...
 # Freezing and Unfreezing the backbone.
 # Pretty much this file creates a neural network that looks at brain MRIs, extracts features (patterns, textures)...
 # It will then decide whether that brain image is Normal or Alzheimers?
-# ==================================================================================================================
+# =================================================================================================================="""
 class ConvNeXtAlzheimer(nn.Module):
-    # num_classes = 2 since there are only 2 classifications (Normal vs AD).
-    # Cheeky little bit of dropout for learning - will turn off neurons during training to prevent overfitting.
-    def __init__(self, model_size='tiny', num_classes = 2, pretrained = True, dropout = 0.3):
+    """num_classes = 2 since there are only 2 classifications (Normal vs AD).
+    Cheeky little bit of dropout for learning - will turn off neurons during training to prevent overfitting."""
+    def __init__(self, model_size = 'tiny', num_classes = 2, pretrained = True, dropout = 0.3):
         super().__init__()
         self.model_size = model_size
         self.num_classes = num_classes
@@ -36,7 +36,7 @@ class ConvNeXtAlzheimer(nn.Module):
         
         self.backbone.classifier = nn.Sequential( # I used this in demo, and it worked well so I love sequential.
             nn.Flatten(start_dim = 1), # Flatten spatial dimensions; must be 1D input not 2D maps.
-            nn.LayerNorm(self.feature_dim, eps = 1e-6), # Normalise features to mean = 0, std = 1; this allows for better stability and convergence.
+            nn.LayerNorm(self.feature_dim, eps = 1e-6), # Normalise features to mean = 0, std = 1.
             nn.Dropout(dropout),
             nn.Linear(self.feature_dim, 512),
             nn.GELU(), # Adds non-linearity (similar to ReLU like in demo2).
@@ -45,6 +45,7 @@ class ConvNeXtAlzheimer(nn.Module):
         )
         
         self._init_classification_head()
+
     
     def _init_classification_head(self):
         # This is new content, but it is suggested to use Xavier initialisation since this will find all the linear layers
