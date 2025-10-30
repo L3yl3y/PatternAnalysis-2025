@@ -12,8 +12,10 @@ from torchvision.models import ConvNeXt_Tiny_Weights, ConvNeXt_Small_Weights, Co
 # It will then decide whether that brain image is Normal or Alzheimers?
 # =================================================================================================================="""
 class ConvNeXtAlzheimer(nn.Module):
-    """num_classes = 2 since there are only 2 classifications (Normal vs AD).
-    Cheeky little bit of dropout for learning - will turn off neurons during training to prevent overfitting."""
+    """ Note num_classes = 2 since there are only 2 classifications (Normal vs AD).
+    Cheeky little bit of dropout for learning - will turn off neurons during training to prevent overfitting.
+    Okay so Tiny = fastest and smallest but least accurate; base = slowest and biggest but most accurate.
+    small = like a balance between the two tiny and base."""
     def __init__(self, model_size = 'tiny', num_classes = 2, pretrained = True, dropout = 0.3):
         super().__init__()
         self.model_size = model_size
@@ -46,41 +48,47 @@ class ConvNeXtAlzheimer(nn.Module):
         
         self._init_classification_head()
 
-    
+    """ Initializes all the layers of the model. Note, this has a bunch of arguments, the one of most importance is the
+    dropout - as this will help the anti-cheating rate for my classification head. Whilst the model_size is the size of
+    the ConvNeXt to use (tiny, small or base)."""
     def _init_classification_head(self):
-        # This is new content, but it is suggested to use Xavier initialisation since this will find all the linear layers
-        # In our classification head and will prevent vanishing/exploding gradients - scaling weight based on the layer size.
+        # This is new content, but it is suggested to use Xavier initialisation since this will find all linear layers
+        # In our classification head and will prevent vanishing/exploding gradients - scaling weight on layer size.
         # Purportedly with Xavier initialisation the weights will be 'just right' and enable more stable training.
         for m in self.backbone.classifier.modules():
             if isinstance(m, nn.Linear): # Iterates through all modules and if it is linear then initialise it.
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
-    
+
+    """ Forward pass that will be how data flows through network; inputs 16 brain images and outputs 16 predictions.
+        The prediction scores will have both normal and AD scores.
+        So flow is brain image input --> backbone ConvNeXt stage --> classification head 
+        --> output logic --> convert to probability.
+        E.x., output = [2.3, -1.7] which has E.x., [92%, 8%] for Normal : AD."""
     def forward(self, x):
-        # Forward pass that will be how the data flows through the network; inputs 16 brain images and then outputs 16 predictions.
-        # The prediction scores will have both normal and AD scores.
-        # So the flow is brain image input --> backbone ConvNeXt stage --> classification head --> output logic --> convert to probability.
-        # E.x., output = [2.3, -1.7] which has E.x., [92%, 8%] for Normal : AD.
         return self.backbone(x) # Pytorch will do all this scary stuff btw.
 
-    # There is this freeze and unfreeze pre-training thing (they call it a two phase training).
-    # So freeze = weights don't change (no learning).
-    # So unfreeze = weights change (learning).
+    """ There is this freeze and unfreeze pre-training thing (they call it a two phase training).
+    So freeze = weights don't change (no learning).
+    So unfreeze = weights change (learning)."""
     def freeze_backbone(self, freeze = True):
         for param in self.backbone.features.parameters():
             param.requires_grad = not freeze
 
+    """ Calculates no. of trainable parameters in the whole model; useful for how 'big' my model."""
     def get_num_params(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
+""" Like the factory --> so this will help building our model and uses the class we made to do so.
+So it will create, initialise and then move the ConvNeXtAlzheimer model to correct device (GPU)."""
 def create_alzheimer_model(model_size = 'base', pretrained = True, dropout = 0.3, device = 'cuda'):
-    model = ConvNeXtAlzheimer(
+    model = ConvNeXtAlzheimer( # Instance of the model blueprint.
         model_size = model_size,
         num_classes = 2,
         pretrained = pretrained, 
         dropout = dropout
     )
 
-    model = model.to(device)
+    model = model.to(device) # GPU here.
     return model
