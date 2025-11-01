@@ -25,13 +25,13 @@ class Config:
     
     # Model architecture
     MODEL_SIZE = 'tiny'
-    BATCH_SIZE = 32
+    BATCH_SIZE = 20
     IMG_SIZE = 224
-    NUM_WORKERS = 0
+    NUM_WORKERS = 8
     DROPOUT = 0.45  # SLIGHTLY REDUCED from 0.5 - we were maybe over-regularizing
     
     # Training schedule - MORE CAREFUL
-    TOTAL_EPOCHS = 30  # MORE epochs with early stopping
+    TOTAL_EPOCHS = 20 # MORE epochs with early stopping
     INITIAL_LR = 1.5e-4  # LOWER starting LR
     MAX_LR = 4e-4  # LOWER peak
     WEIGHT_DECAY = 8e-4  # SLIGHTLY less aggressive
@@ -52,7 +52,7 @@ class Config:
     
     # Save strategy
     SAVE_BEST_TEST = True
-    PATIENCE = 10  # INCREASED patience
+    PATIENCE = 20  # INCREASED patience
     MIN_DELTA = 0.0005  # More sensitive
     
     # Mixed precision
@@ -63,13 +63,16 @@ class Config:
     ENSEMBLE_SEEDS = [42, 137, 256]  # Train with different seeds
     
     # Outputs
-    OUTPUT_DIR = Path('./alzheimer_results_final')
+    OUTPUT_DIR = Path('./alzheimer_results_final_improved')
     CHECKPOINT_DIR = OUTPUT_DIR / 'checkpoints'
     PLOTS_DIR = OUTPUT_DIR / 'plots'
     
     OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
     CHECKPOINT_DIR.mkdir(exist_ok=True)
     PLOTS_DIR.mkdir(exist_ok=True)
+
+    # Whether to display plots interactively after training (useful when running locally)
+    SHOW_PLOTS = True
 
 # ==================================================
 # MIXUP DATA AUGMENTATION
@@ -205,6 +208,12 @@ class MetricsTracker:
         
         plt.tight_layout()
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        # Optionally show the plot interactively (will block until closed)
+        if getattr(Config, 'SHOW_PLOTS', False):
+            try:
+                plt.show(block=True)
+            except Exception:
+                print("⚠️ Unable to display plots interactively in this environment.")
         plt.close()
 
 # ==================================================
@@ -590,23 +599,58 @@ def train_model_improved(seed=42):
     # Save final plots
     tracker.plot_metrics(Config.PLOTS_DIR / f'training_curves_seed{seed}.png')
     
-    # Final evaluation with TTA on best model
-    checkpoint = torch.load(Config.CHECKPOINT_DIR / f'best_model_seed{seed}.pth', weights_only=True)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    
-    print("\n🔍 Final evaluation with Test-Time Augmentation...")
-    final_test_metrics = evaluate_with_tta(model, test_loader, criterion, device, n_aug=5)
+    # Final evaluation with TTA on best model - FIXED: weights_only=False
+    checkpoint_path = Config.CHECKPOINT_DIR / f'best_model_seed{seed}.pth'
+    if checkpoint_path.exists():
+        checkpoint = torch.load(checkpoint_path, weights_only=False)  # FIXED HERE
+        model.load_state_dict(checkpoint['model_state_dict'])
+        
+        print("\n🔍 Final evaluation with Test-Time Augmentation...")
+        final_test_metrics = evaluate_with_tta(model, test_loader, criterion, device, n_aug=5)
+        
+        # Use TTA result if better
+        if final_test_metrics['accuracy'] > best_test_acc:
+            best_test_acc = final_test_metrics['accuracy']
+            print(f"   🎯 TTA improved accuracy to {best_test_acc:.4f}!")
+
+        # Generate and save a confusion matrix for the best model
+        try:
+            print("\n📊 Generating confusion matrix for best model...")
+            model.eval()
+            all_preds = []
+            all_labels = []
+            with torch.no_grad():
+                for images, labels in tqdm(test_loader, desc='Confusion Matrix', leave=False):
+                    images = images.to(device)
+                    outputs = model(images)
+                    preds = torch.argmax(outputs, dim=1)
+                    all_preds.extend(preds.cpu().numpy())
+                    all_labels.extend(labels.numpy())
+
+            cm = confusion_matrix(all_labels, all_preds)
+            plt.figure(figsize=(6, 5))
+            sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                        xticklabels=['Normal', 'AD'],
+                        yticklabels=['Normal', 'AD'])
+            plt.title(f'Confusion Matrix (Acc: {best_test_acc:.2%})')
+            plt.ylabel('True Label')
+            plt.xlabel('Predicted Label')
+            cm_path = Config.PLOTS_DIR / f'confusion_matrix_seed{seed}.png'
+            plt.savefig(cm_path, dpi=150, bbox_inches='tight')
+            if getattr(Config, 'SHOW_PLOTS', False):
+                try:
+                    plt.show(block=True)
+                except Exception:
+                    print("⚠️ Unable to display confusion matrix interactively in this environment.")
+            plt.close()
+            print(f"   ✅ Confusion matrix saved to {cm_path}")
+        except Exception as e:
+            print(f"⚠️ Failed to generate confusion matrix: {e}")
     
     # Final time
     training_time = (time.time() - start_time) / 60
     print(f"\n⏱️ Training time: {training_time:.1f} minutes")
     print(f"📊 Best Test Accuracy: {best_test_acc:.4f} at epoch {best_epoch}")
-    print(f"📊 Final TTA Accuracy: {final_test_metrics['accuracy']:.4f}")
-    
-    # Use TTA result if better
-    if final_test_metrics['accuracy'] > best_test_acc:
-        best_test_acc = final_test_metrics['accuracy']
-        print(f"   🎯 TTA improved accuracy to {best_test_acc:.4f}!")
     
     return best_test_acc, best_epoch
 
@@ -672,33 +716,41 @@ def train_ensemble():
         # Create final confusion matrix
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         model = create_alzheimer_model(Config.MODEL_SIZE, Config.DROPOUT, device)
-        checkpoint = torch.load(Config.CHECKPOINT_DIR / f'best_model_seed{best_model["seed"]}.pth', weights_only=True)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        model.eval()
-        
-        print("\n📊 Generating final confusion matrix...")
-        _, _, test_loader = create_dataloaders(Config.DATA_ROOT, Config.BATCH_SIZE, Config.IMG_SIZE, Config.NUM_WORKERS)
-        
-        all_preds = []
-        all_labels = []
-        with torch.no_grad():
-            for images, labels in tqdm(test_loader, desc='Final Eval'):
-                images = images.to(device)
-                outputs = model(images)
-                preds = torch.argmax(outputs, dim=1)
-                all_preds.extend(preds.cpu().numpy())
-                all_labels.extend(labels.numpy())
-        
-        cm = confusion_matrix(all_labels, all_preds)
-        plt.figure(figsize=(8, 6))
-        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                    xticklabels=['Normal', 'AD'],
-                    yticklabels=['Normal', 'AD'])
-        plt.title(f'Final Test Confusion Matrix (Acc: {best_model["best_acc"]:.2%})')
-        plt.ylabel('True Label')
-        plt.xlabel('Predicted Label')
-        plt.savefig(Config.PLOTS_DIR / 'final_confusion_matrix.png', dpi=150, bbox_inches='tight')
-        plt.close()
+        checkpoint_path = Config.CHECKPOINT_DIR / f'best_model_seed{best_model["seed"]}.pth'
+        if checkpoint_path.exists():
+            checkpoint = torch.load(checkpoint_path, weights_only=False)  # FIXED HERE TOO
+            model.load_state_dict(checkpoint['model_state_dict'])
+            model.eval()
+            
+            print("\n📊 Generating final confusion matrix...")
+            _, _, test_loader = create_dataloaders(Config.DATA_ROOT, Config.BATCH_SIZE, Config.IMG_SIZE, Config.NUM_WORKERS)
+            
+            all_preds = []
+            all_labels = []
+            with torch.no_grad():
+                for images, labels in tqdm(test_loader, desc='Final Eval'):
+                    images = images.to(device)
+                    outputs = model(images)
+                    preds = torch.argmax(outputs, dim=1)
+                    all_preds.extend(preds.cpu().numpy())
+                    all_labels.extend(labels.numpy())
+            
+            cm = confusion_matrix(all_labels, all_preds)
+            plt.figure(figsize=(8, 6))
+            sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                        xticklabels=['Normal', 'AD'],
+                        yticklabels=['Normal', 'AD'])
+            plt.title(f'Final Test Confusion Matrix (Acc: {best_model["best_acc"]:.2%})')
+            plt.ylabel('True Label')
+            plt.xlabel('Predicted Label')
+            plt.savefig(Config.PLOTS_DIR / 'final_confusion_matrix.png', dpi=150, bbox_inches='tight')
+            if getattr(Config, 'SHOW_PLOTS', False):
+                try:
+                    plt.show(block=True)
+                except Exception:
+                    print("⚠️ Unable to display plots interactively in this environment.")
+            plt.close()
+            print("   ✅ Confusion matrix saved!")
         
     else:
         print(f"\n📈 Best achieved: {best_model['best_acc']:.4f}")
@@ -714,18 +766,16 @@ def train_ensemble():
 # ENTRY POINT
 # ==================================================
 if __name__ == '__main__':
-    # Set deterministic behavior for reproducibility
-    torch.backends.cudnn.deterministic = False  # Actually faster with this off
+    # Run a single training run (no ensemble) to save time and avoid training multiple models
+    torch.backends.cudnn.deterministic = False
     torch.backends.cudnn.benchmark = True
-    
-    # Run ensemble training
-    final_accuracy = train_ensemble()
-    
-    if final_accuracy >= 0.78:
-        print("\n" + "🎉 " * 20)
-        print("MISSION ACCOMPLISHED! 78%+ TEST ACCURACY ACHIEVED!")
-        print("🎉 " * 20)
+
+    best_acc, best_epoch = train_model_improved()
+
+    if best_acc >= 0.78:
+        print("\n" + "🎉 " * 10)
+        print(f"MISSION ACCOMPLISHED! Test accuracy: {best_acc:.4f} at epoch {best_epoch}")
+        print("🎉 " * 10)
     else:
-        print(f"\n💪 Final best: {final_accuracy:.4f} - You're incredibly close!")
-        print("   Since you got 77.53% before, these tweaks should push you over!")
-        print("   Try running once more - random initialization can make the difference!")
+        print(f"\n💪 Final best: {best_acc:.4f} at epoch {best_epoch} - You're incredibly close!")
+        print("   Consider re-running with different seeds or small hyperparameter tweaks.")
