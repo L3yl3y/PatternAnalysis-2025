@@ -6,8 +6,6 @@ from torch.optim.lr_scheduler import OneCycleLR, CosineAnnealingLR
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from pathlib import Path
-from tqdm import tqdm
 import time
 import json
 import warnings
@@ -92,7 +90,7 @@ class ImprovedLoss(nn.Module):
 # ==================================================
 def mixup_data(x, y, alpha=1.0):
     if alpha > 0:
-        lam = np.random.beta(alpha, alpha)
+        lam = np.random.beta(alpha, alpha) # Lam is the blended amount (so lam = 0.7% means 70% of image A; 30% of B.
     else:
         lam = 1
     
@@ -110,6 +108,7 @@ def mixup_criterion(criterion, pred, y_a, y_b, lam):
 # METRICS TRACKER
 # ==================================================
 class MetricsTracker:
+    """ Bunch of empty lists."""
     def __init__(self):
         self.train_losses = []
         self.val_losses = []
@@ -132,18 +131,20 @@ class MetricsTracker:
         self.test_accs.append(test_acc)
         self.test_recalls.append(test_recall)
         self.learning_rates.append(lr)
-    
+
+    """Generates and saves all training graphs; matplotlib creates big 2x3 grid of all the plots.
+    Sidenote, it really helps me see how much my model sucks when it overfits T_T"""
     def plot_metrics(self, save_path):
         fig, axes = plt.subplots(2, 2, figsize=(12, 10))
         
-        # Loss
-        axes[0, 0].plot(self.train_losses, label='Train', linewidth=2)
-        axes[0, 0].plot(self.val_losses, label='Val', linewidth=2)
+        # Loss:
+        axes[0, 0].plot(self.train_losses, label = 'Train', linewidth = 2)
+        axes[0, 0].plot(self.val_losses, label = 'Val', linewidth = 2)
         axes[0, 0].set_xlabel('Epoch')
         axes[0, 0].set_ylabel('Loss')
         axes[0, 0].set_title('Training & Validation Loss')
         axes[0, 0].legend()
-        axes[0, 0].grid(True, alpha=0.3)
+        axes[0, 0].grid(True, alpha = 0.3)
         
         # Accuracy - FOCUS ON TEST
         axes[0, 1].plot(self.train_accs, label='Train', linewidth=2, alpha=0.5)
@@ -154,7 +155,7 @@ class MetricsTracker:
         axes[0, 1].set_ylabel('Accuracy')
         axes[0, 1].set_title('Accuracy Curves (TEST in RED)')
         axes[0, 1].legend()
-        axes[0, 1].grid(True, alpha=0.3)
+        axes[0, 1].grid(True, alpha = 0.3)
         
         # Test Recall & Precision
         axes[1, 0].plot(self.test_recalls, label='Test Recall', linewidth=2, color='green')
@@ -164,15 +165,15 @@ class MetricsTracker:
         axes[1, 0].set_ylabel('Recall')
         axes[1, 0].set_title('Recall (Need Higher for Better AD Detection)')
         axes[1, 0].legend()
-        axes[1, 0].grid(True, alpha=0.3)
+        axes[1, 0].grid(True, alpha = 0.3)
         
-        # Learning Rate
-        axes[1, 1].plot(self.learning_rates, linewidth=2, color='orange')
+        # Learning Rate:
+        axes[1, 1].plot(self.learning_rates, linewidth = 2, color = 'orange')
         axes[1, 1].set_xlabel('Epoch')
         axes[1, 1].set_ylabel('Learning Rate')
         axes[1, 1].set_title('Learning Rate Schedule')
         axes[1, 1].set_yscale('log')
-        axes[1, 1].grid(True, alpha=0.3)
+        axes[1, 1].grid(True, alpha = 0.3)
         
         plt.tight_layout()
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
@@ -182,7 +183,7 @@ class MetricsTracker:
 # TRAINING WITH STRONGER REGULARIZATION
 # ==================================================
 def train_one_epoch(model, dataloader, criterion, optimizer, device, scaler, epoch):
-    model.train()
+    model.train() # Put model in training mode.
     running_loss = 0.0
     all_preds = []
     all_labels = []
@@ -212,10 +213,11 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, scaler, epo
             
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), Config.GRADIENT_CLIP)
-            scaler.step(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), Config.GRADIENT_CLIP) # Gradient clipping.
+            scaler.step(optimizer) # Optimiser step.
             scaler.update()
         else:
+            # Full precision path (no mixed precision).
             outputs = model(images)
             if mixed:
                 loss = mixup_criterion(criterion, outputs, labels_a, labels_b, lam)
@@ -269,7 +271,7 @@ def evaluate(model, dataloader, criterion, device, split='Val'):
     
     epoch_loss = running_loss / len(dataloader.dataset)
     
-    metrics = {
+    metrics = { # Put all our results into the dict --> cleaner than needing to call all 7 different values.
         'loss': epoch_loss,
         'accuracy': accuracy_score(all_labels, all_preds),
         'precision': precision_score(all_labels, all_preds, zero_division=0),
@@ -304,20 +306,20 @@ def train_model():
     
     # Data loading
     print(f"\n📁 Loading data from {Config.DATA_ROOT}")
-    train_loader, val_loader, test_loader = create_dataloaders(
-        data_root=Config.DATA_ROOT,
-        batch_size=Config.BATCH_SIZE,
-        img_size=Config.IMG_SIZE,
-        num_workers=Config.NUM_WORKERS
+    train_loader, val_loader, test_loader = create_dataloaders( # Data loading.
+        data_root = Config.DATA_ROOT,
+        batch_size = Config.BATCH_SIZE,
+        img_size = Config.IMG_SIZE,
+        num_workers = Config.NUM_WORKERS
     )
     print(f"📊 Train: {len(train_loader.dataset)} | Val: {len(val_loader.dataset)} | Test: {len(test_loader.dataset)}")
     
     # Model with MORE dropout
     print(f"\n🏗️ Building ConvNeXt-{Config.MODEL_SIZE} with dropout={Config.DROPOUT}")
     model = create_alzheimer_model(
-        model_size=Config.MODEL_SIZE,
-        dropout=Config.DROPOUT,
-        device=device
+        model_size = Config.MODEL_SIZE,
+        dropout = Config.DROPOUT,
+        device = device
     )
     print(f"   Parameters: {sum(p.numel() for p in model.parameters()):,}")
     
@@ -330,10 +332,10 @@ def train_model():
     
     # Optimizer with MORE weight decay
     optimizer = optim.AdamW(
-        model.parameters(),
-        lr=Config.INITIAL_LR,
-        weight_decay=Config.WEIGHT_DECAY,
-        betas=(0.9, 0.999)
+        model.parameters(), # Tell AdamW what to optimise (so every trainable weight in the model).
+        lr = Config.INITIAL_LR,
+        weight_decay = Config.WEIGHT_DECAY,
+        betas = (0.9, 0.999)
     )
     
     # Cosine scheduler
@@ -493,7 +495,7 @@ def train_model():
     total_time = (time.time() - start_time) / 60
     print(f"\n⏱️ Total training time: {total_time:.1f} minutes")
     
-    # Save final results
+    # Save final results:
     final_results = {
         'config': {
             'model_size': Config.MODEL_SIZE,
@@ -513,9 +515,10 @@ def train_model():
         },
         'training_time_minutes': float(total_time)
     }
-    
+
+    # This is how you actually write the final_results dictionary to the final_results.json file.
     with open(Config.OUTPUT_DIR / 'final_results.json', 'w') as f:
-        json.dump(final_results, f, indent=4)
+        json.dump(final_results, f, indent = 4) # indent = 4.
     
     return final_test_metrics
 
