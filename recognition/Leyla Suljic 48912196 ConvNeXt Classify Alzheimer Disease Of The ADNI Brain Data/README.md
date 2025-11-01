@@ -369,5 +369,36 @@ most valuable, as these subtle changes are hard for human radiologists to spot c
 
 ## (11) References:
 
+1. **El-Assy, A. M., Elhoseny, H. M., & Elhoseny, M.** (2024). A novel CNN architecture for accurate early detection 
+and classification of Alzheimer's disease using MRI data. *Scientific Reports, 14*, Article 3463.
+https://doi.org/10.1038/s41598-024-53733-6
 
+
+2. **Howard, J., & Ruder, S.** (2018). Universal Language Model Fine-tuning for Text Classification. *Proceedings of 
+the 56th Annual Meeting of the Association for Computational Linguistics*, 328 - 339. 
+https://doi.org/10.18653/v1/P18-1031
+
+
+3. **Lin, T. Y., Goyal, P., Girshick, R., He, K., & Dollár, P.** (2017). Focal loss for dense object detection. 
+*Proceedings of the IEEE International Conference on Computer Vision*, 2980 - 2988. 
+https://doi.org/10.1109/ICCV.2017.324
+
+
+4. **Liu, Z., Mao, H., Wu, C. Y., Feichtenhofer, C., Darrell, T., & Xie, S.** (2022). A ConvNet for the 2020s. 
+*Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition*, 11976 - 11986. 
+https://doi.org/10.1109/CVPR52688.2022.01167
+
+
+5. **Loshchilov, I., & Hutter, F.** (2017). SGDR: Stochastic gradient descent with warm restarts. 
+*International Conference on Learning Representations (ICLR)*. 
+https://arxiv.org/abs/1608.03983
+
+
+6. **Petersen, R. C., Aisen, P. S., Beckett, L. A., Donohue, M. C., Gamst, A. C., Harvey, D. J., ... & Weiner, M. W.** 
+(2010). Alzheimer's Disease Neuroimaging Initiative (ADNI): Clinical characterization. 
+*Neurology, 74*(3), 201 - 209. https://doi.org/10.1212/WNL.0b013e3181cb3e25
+
+
+7. **Zhang, H., Cisse, M., Dauphin, Y. N., & Lopez-Paz, D.** (2018). mixup: Beyond empirical risk minimization. 
+*International Conference on Learning Representations (ICLR)*. https://arxiv.org/abs/1710.09412
 
